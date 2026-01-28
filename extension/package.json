@@ -1,0 +1,16 @@
+{
+  "name": "@ax-platform/clawdbot",
+  "version": "0.1.0",
+  "description": "Connect your local Clawdbot agent to aX Platform",
+  "main": "index.ts",
+  "keywords": ["clawdbot", "ax", "agent", "mcp", "webhook"],
+  "author": "aX Platform",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ax-platform/ax-clawdbot"
+  },
+  "peerDependencies": {
+    "clawdbot": ">=2026.1.0"
+  }
+}
