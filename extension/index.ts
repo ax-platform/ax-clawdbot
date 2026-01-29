@@ -18,11 +18,8 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import * as crypto from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
-
-const execFileAsync = promisify(execFile);
 import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
 
 // =============================================================================
@@ -579,12 +576,21 @@ function createAxDispatchHandler(api: ClawdbotPluginApi) {
   };
 }
 
+// Maximum prompt size (100KB) - prevents injection attacks and E2BIG errors
+const MAX_PROMPT_SIZE = 100 * 1024;
+
 async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayload): Promise<string> {
   // V3 uses user_message for the content
-  const prompt = payload.user_message || payload.content || payload.message?.content;
+  let prompt = payload.user_message || payload.content || payload.message?.content;
   if (!prompt) {
     api.logger.warn(`[ax-platform] No content found in payload. Keys: ${Object.keys(payload).join(', ')}`);
     return "No message content received.";
+  }
+
+  // Enforce prompt size limit for security and reliability
+  if (prompt.length > MAX_PROMPT_SIZE) {
+    api.logger.warn(`[ax-platform] Prompt too large (${prompt.length} bytes), truncating to ${MAX_PROMPT_SIZE}`);
+    prompt = prompt.slice(0, MAX_PROMPT_SIZE) + "\n\n[Message truncated due to size limit]";
   }
 
   api.logger.info(`[ax-platform] Got user_message: ${prompt.substring(0, 100)}`);
@@ -649,7 +655,8 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
     };
 
     // Use clawdbot CLI - full path needed since gateway subprocess doesn't have user's PATH
-    // SECURITY: Use execFile with argument array to avoid shell injection
+    // SECURITY: Use spawn with argument array to avoid shell injection
+    // Size limit (100KB) enforced above protects against E2BIG errors
     const clawdbotCmd = process.env.CLAWDBOT_CMD || '/Users/jacob/.npm-global/bin/clawdbot';
     const args = [
       'agent',
@@ -659,37 +666,51 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
       '--json'
     ];
 
-    let output = '';
-    try {
-      const { stdout, stderr } = await execFileAsync(
-        clawdbotCmd,
-        args,
-        {
-          timeout: 120000, // 120 second timeout
-          maxBuffer: 1024 * 1024 * 5, // 5MB buffer
-          env: subprocessEnv,
-        }
-      );
+    const output = await new Promise<string>((resolve, reject) => {
+      const child = spawn(clawdbotCmd, args, {
+        env: subprocessEnv,
+      });
 
-      if (stderr) {
-        api.logger.warn(`[ax-platform] Agent stderr: ${stderr.substring(0, 200)}`);
-      }
-      output = stdout.trim();
-    } catch (execErr: unknown) {
-      // execFileAsync throws on non-zero exit, but output may still be valid
-      const err = execErr as { stdout?: string; stderr?: string; code?: number; message?: string };
-      api.logger.warn(`[ax-platform] Agent command exited with error (code=${err.code}): ${err.message?.substring(0, 100)}`);
-      if (err.stdout) {
-        api.logger.info(`[ax-platform] Attempting to extract response from error stdout (${err.stdout.length} chars)`);
-        output = err.stdout.trim();
-      } else if (err.stderr) {
-        api.logger.warn(`[ax-platform] Error stderr: ${err.stderr.substring(0, 200)}`);
-      }
-      // If no output at all, re-throw to hit the outer catch
-      if (!output) {
-        throw execErr;
-      }
-    }
+      let stdout = '';
+      let stderr = '';
+
+      // Set timeout manually since spawn doesn't have built-in timeout
+      const timeout = setTimeout(() => {
+        child.kill('SIGTERM');
+        reject(new Error('Agent command timed out after 120s'));
+      }, 120000);
+
+      child.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+
+      child.on('close', (code) => {
+        clearTimeout(timeout);
+        if (stderr) {
+          api.logger.warn(`[ax-platform] Agent stderr: ${stderr.substring(0, 200)}`);
+        }
+        // Even on non-zero exit, try to use stdout if available
+        if (stdout.trim()) {
+          if (code !== 0) {
+            api.logger.warn(`[ax-platform] Agent exited with code ${code}, but has stdout output`);
+          }
+          resolve(stdout.trim());
+        } else if (code !== 0) {
+          reject(new Error(`Agent exited with code ${code}`));
+        } else {
+          resolve('');
+        }
+      });
+    });
     api.logger.info(`[ax-platform] Agent output length: ${output.length}`);
 
     // Parse JSON response - clawdbot --json outputs { payloads: [{ text: "..." }], meta: {...} }
