@@ -624,20 +624,37 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
 
     // Use clawdbot CLI - full path needed since gateway subprocess doesn't have user's PATH
     const clawdbotCmd = process.env.CLAWDBOT_CMD || '/Users/jacob/.npm-global/bin/clawdbot';
-    const { stdout, stderr } = await execAsync(
-      `${clawdbotCmd} agent --message '${escapedPrompt}' --session-id '${sessionId}' --local --json 2>&1`,
-      {
-        timeout: 120000, // 120 second timeout
-        maxBuffer: 1024 * 1024 * 5, // 5MB buffer
-        env: subprocessEnv,
+
+    let output = '';
+    try {
+      const { stdout, stderr } = await execAsync(
+        `${clawdbotCmd} agent --message '${escapedPrompt}' --session-id '${sessionId}' --local --json 2>&1`,
+        {
+          timeout: 120000, // 120 second timeout
+          maxBuffer: 1024 * 1024 * 5, // 5MB buffer
+          env: subprocessEnv,
+        }
+      );
+
+      if (stderr) {
+        api.logger.warn(`[ax-platform] Agent stderr: ${stderr.substring(0, 200)}`);
       }
-    );
-
-    if (stderr) {
-      api.logger.warn(`[ax-platform] Agent stderr: ${stderr.substring(0, 200)}`);
+      output = stdout.trim();
+    } catch (execErr: unknown) {
+      // execAsync throws on non-zero exit, but output may still be valid
+      const err = execErr as { stdout?: string; stderr?: string; code?: number; message?: string };
+      api.logger.warn(`[ax-platform] Agent command exited with error (code=${err.code}): ${err.message?.substring(0, 100)}`);
+      if (err.stdout) {
+        api.logger.info(`[ax-platform] Attempting to extract response from error stdout (${err.stdout.length} chars)`);
+        output = err.stdout.trim();
+      } else if (err.stderr) {
+        api.logger.warn(`[ax-platform] Error stderr: ${err.stderr.substring(0, 200)}`);
+      }
+      // If no output at all, re-throw to hit the outer catch
+      if (!output) {
+        throw execErr;
+      }
     }
-
-    const output = stdout.trim();
     api.logger.info(`[ax-platform] Agent output length: ${output.length}`);
 
     // Parse JSON response - clawdbot --json outputs { payloads: [{ text: "..." }], meta: {...} }
