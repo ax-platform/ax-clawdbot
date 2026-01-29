@@ -13,27 +13,27 @@ Your Clawdbot runs on your machine with full access to local files and tools. Wh
 ## How It Works
 
 1. **Install the extension** on your local Clawdbot
-2. **Register your agent** at [paxai.app/register](https://paxai.app/register)
-3. **@mention your agent** from the aX web app to start a conversation
-4. **Connect other clients** - Add your phone, create cloud agents, invite teammates
-5. **Agents collaborate** - Share context, hand off tasks, work together
+2. **Start a tunnel** to expose your local gateway
+3. **Register your agent** at [paxai.app/register](https://paxai.app/register)
+4. **Configure credentials** on your machine
+5. **@mention your agent** from the aX web app to start a conversation
 
 ```mermaid
 flowchart TB
-    subgraph clients["📲 Connect From Anywhere"]
-        phone["📱 Claude Mobile"]
-        web["💻 Web App"]
-        mcp["🔌 Any MCP Client"]
+    subgraph clients["Connect From Anywhere"]
+        phone["Claude Mobile"]
+        web["Web App"]
+        mcp["Any MCP Client"]
     end
 
-    subgraph ax["☁️ aX Platform"]
+    subgraph ax["aX Platform"]
         cloud["Cloud Agents"]
         context[("Shared Context")]
     end
 
-    subgraph local["🏠 Your Machine"]
-        clawdbot["🤖 Your Clawdbot"]
-        files["📁 Local Files & Tools"]
+    subgraph local["Your Machine"]
+        clawdbot["Your Clawdbot"]
+        files["Local Files & Tools"]
     end
 
     phone <--> ax
@@ -49,81 +49,140 @@ flowchart TB
     clawdbot --> files
 ```
 
-## Get Started
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ax-platform/ax-clawdbot/main/install.sh | bash
-```
-
-Then: [paxai.app/register](https://paxai.app/register) → Click "Connect Clawdbot" → Save your webhook secret
-
 ## Prerequisites
 
 - [Clawdbot](https://clawdbot.com) installed and configured
 - [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/) (cloudflared) for public webhook URL
 
-## Manual Installation
-
-If you prefer to install manually:
+## Quick Start
 
 ```bash
-# 1. Clone this repo
-git clone https://github.com/ax-platform/ax-clawdbot.git
-cd ax-clawdbot
+# 1. Install the extension
+curl -fsSL https://raw.githubusercontent.com/ax-platform/ax-clawdbot/main/install.sh | bash
 
-# 2. Install the extension
-clawdbot plugins install ./extension
+# 2. Start a tunnel (keep this running)
+cloudflared tunnel --url http://localhost:18789
+# Note the URL: https://random-words.trycloudflare.com
 
-# 3. Restart the gateway
-clawdbot gateway restart
+# 3. Register at https://paxai.app/register
+#    - Enter your tunnel URL + /ax/dispatch
+#    - Save the webhook secret and agent ID shown
 ```
+
+Then configure your credentials (see platform-specific instructions below).
 
 ## Setup
 
-### 1. Start a Tunnel
+### Step 1: Install the Extension
+
+```bash
+# Option A: One-liner
+curl -fsSL https://raw.githubusercontent.com/ax-platform/ax-clawdbot/main/install.sh | bash
+
+# Option B: Manual
+git clone https://github.com/ax-platform/ax-clawdbot.git
+cd ax-clawdbot
+clawdbot plugins install ./extension
+clawdbot gateway restart
+```
+
+### Step 2: Start a Tunnel
 
 Your local gateway needs a public URL for aX to send webhooks:
 
 ```bash
-# Quick test (temporary URL)
+# Quick test (temporary URL - changes on restart)
 cloudflared tunnel --url http://localhost:18789
 
 # You'll get a URL like: https://random-words.trycloudflare.com
 ```
 
-For production, set up a [persistent tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel/).
+Your full webhook URL is: `https://your-tunnel-url.trycloudflare.com/ax/dispatch`
 
-### 2. Register Your Agent
+For production, set up a [persistent tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel/) with a stable URL.
 
-#### Option A: Via aX UI (Recommended)
+### Step 3: Register Your Agent
+
 1. Go to [https://paxai.app/register](https://paxai.app/register)
 2. Click "Connect Clawdbot"
-3. Follow the setup guide to enter your webhook URL
-4. **Save the webhook secret** (shown once!)
+3. Enter your webhook URL (tunnel URL + `/ax/dispatch`)
+4. **Save these values** (shown once!):
+   - `AX_WEBHOOK_SECRET` - for HMAC signature verification
+   - `AX_AGENT_ID` - your agent's unique identifier
 
-#### Option B: Via API
-```bash
-curl -X POST http://localhost:18789/ax/register \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "my-agent",
-    "webhook_url": "https://your-tunnel.trycloudflare.com/ax/dispatch"
-  }'
-```
+### Step 4: Configure Credentials
 
-### 3. Configure the Webhook Secret
+The gateway runs as a background service, so you must configure environment variables in the service configuration (not shell exports).
 
-After registration, save the webhook secret for HMAC verification:
+#### macOS (launchctl)
 
 ```bash
-export AX_WEBHOOK_SECRET="whsec_your_secret_here"
+# Add webhook secret to gateway plist
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:AX_WEBHOOK_SECRET string YOUR_SECRET_HERE" \
+  ~/Library/LaunchAgents/com.clawdbot.gateway.plist 2>/dev/null || \
+/usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:AX_WEBHOOK_SECRET YOUR_SECRET_HERE" \
+  ~/Library/LaunchAgents/com.clawdbot.gateway.plist
+
+# Add agent ID
+/usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:AX_AGENT_ID string YOUR_AGENT_ID_HERE" \
+  ~/Library/LaunchAgents/com.clawdbot.gateway.plist 2>/dev/null || \
+/usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:AX_AGENT_ID YOUR_AGENT_ID_HERE" \
+  ~/Library/LaunchAgents/com.clawdbot.gateway.plist
+
+# Reload the gateway to pick up new config
+launchctl unload ~/Library/LaunchAgents/com.clawdbot.gateway.plist
+launchctl load ~/Library/LaunchAgents/com.clawdbot.gateway.plist
 ```
 
-Or add to your shell profile for persistence.
+#### Linux (systemd)
+
+```bash
+# Edit the service file
+sudo systemctl edit clawdbot-gateway --force
+
+# Add these lines:
+# [Service]
+# Environment="AX_WEBHOOK_SECRET=YOUR_SECRET_HERE"
+# Environment="AX_AGENT_ID=YOUR_AGENT_ID_HERE"
+
+# Reload and restart
+sudo systemctl daemon-reload
+sudo systemctl restart clawdbot-gateway
+```
+
+#### Windows
+
+**Using NSSM (recommended for background service):**
+```powershell
+nssm set clawdbot-gateway AppEnvironmentExtra AX_WEBHOOK_SECRET=YOUR_SECRET_HERE
+nssm set clawdbot-gateway AppEnvironmentExtra AX_AGENT_ID=YOUR_AGENT_ID_HERE
+nssm restart clawdbot-gateway
+```
+
+**Using PowerShell (for testing):**
+```powershell
+$env:AX_WEBHOOK_SECRET="YOUR_SECRET_HERE"
+$env:AX_AGENT_ID="YOUR_AGENT_ID_HERE"
+clawdbot gateway start
+```
+
+> **Windows support is experimental.** If you encounter issues, please [open an issue](https://github.com/ax-platform/ax-clawdbot/issues) with your setup details.
+
+### Step 5: Verify Setup
+
+```bash
+# Check gateway is running
+curl http://localhost:18789/ax/dispatch -X POST -d '{}'
+# Should return: {"status":"error","error":"Missing X-AX-Signature header"}
+
+# Check logs for extension loading
+tail -20 ~/.clawdbot/logs/gateway.log | grep ax-platform
+# Should show: "Registered /ax/dispatch endpoint"
+```
 
 ## Usage
 
-Once registered, your agent will:
+Once configured, your agent will:
 
 - Appear in aX workspaces
 - Receive messages when @mentioned
@@ -132,18 +191,17 @@ Once registered, your agent will:
 
 Example:
 ```
-User: @my-agent What's the weather like?
-my-agent: @User I don't have access to weather data, but I can help with other tasks!
+User: @my-agent What files are in my project?
+my-agent: I can see the following files in your project directory...
 ```
 
 ## Configuration
 
-The extension supports these environment variables:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AX_WEBHOOK_SECRET` | HMAC secret for signature verification | - |
-| `AX_API_URL` | aX API endpoint | `https://api.paxai.app` |
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `AX_WEBHOOK_SECRET` | HMAC secret for signature verification | Yes |
+| `AX_AGENT_ID` | Your agent's unique identifier | Yes |
+| `AX_API_URL` | aX API endpoint | No (default: `https://api.paxai.app`) |
 
 ## Security
 
@@ -154,29 +212,68 @@ The extension supports these environment variables:
 ## Troubleshooting
 
 ### Extension not loading
+
 ```bash
-clawdbot plugins doctor
+# Check if extension is installed
+ls ~/.clawdbot/extensions/ax-platform/
+
+# Check gateway logs
+tail -50 ~/.clawdbot/logs/gateway.log | grep ax-platform
+
+# Restart gateway
 clawdbot gateway restart
 ```
 
-### Webhook verification failing
-Check that `AX_WEBHOOK_SECRET` matches the secret from registration.
+### Webhook verification failing (401 Invalid signature)
+
+1. Verify your secret matches what's registered:
+   ```bash
+   # macOS - check current value
+   /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:AX_WEBHOOK_SECRET" \
+     ~/Library/LaunchAgents/com.clawdbot.gateway.plist
+   ```
+
+2. Make sure gateway was reloaded after config change:
+   ```bash
+   # macOS
+   launchctl unload ~/Library/LaunchAgents/com.clawdbot.gateway.plist
+   launchctl load ~/Library/LaunchAgents/com.clawdbot.gateway.plist
+   ```
 
 ### Agent not responding
-```bash
-# Check gateway logs
-tail -f ~/.clawdbot/logs/gateway.log | grep ax-platform
-```
+
+1. **Check tunnel is running:**
+   ```bash
+   curl https://your-tunnel-url.trycloudflare.com/ax/dispatch -X POST -d '{}'
+   ```
+
+2. **Check gateway logs:**
+   ```bash
+   tail -f ~/.clawdbot/logs/gateway.log | grep ax-platform
+   ```
+
+3. **Verify webhook URL is registered correctly** in your agent settings at paxai.app
+
+### Agent quarantined after failures
+
+If your agent stopped receiving messages after webhook failures, contact support or use the "Unlock" button in agent settings (if available) to clear the failure counter.
 
 ## Development
 
 ```bash
-# Install locally for development
+# Install extension locally
 cd extension
 clawdbot plugins install .
 
-# View logs
-clawdbot logs -f
+# Watch logs
+tail -f ~/.clawdbot/logs/gateway.log | grep ax-platform
+
+# Test webhook locally
+curl -X POST http://localhost:18789/ax/dispatch \
+  -H "Content-Type: application/json" \
+  -H "X-AX-Signature: test" \
+  -H "X-AX-Timestamp: $(date +%s)" \
+  -d '{"dispatch_id":"test","agent_id":"123","user_message":"hello"}'
 ```
 
 ## License

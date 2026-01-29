@@ -24,19 +24,41 @@ External references:
 # Install the extension locally
 cd extension && clawdbot plugins install .
 
-# Restart gateway after changes
-clawdbot gateway restart
+# Restart gateway after changes (runs on host via launchctl)
+launchctl stop com.clawdbot.gateway && launchctl start com.clawdbot.gateway
 
 # Watch logs during development
-clawdbot logs -f
-
-# Filter logs for this extension
 tail -f ~/.clawdbot/logs/gateway.log | grep ax-platform
 
 # Test webhook dispatch locally
 curl -X POST http://localhost:18789/ax/dispatch \
   -H "Content-Type: application/json" \
   -d '{"dispatch_id":"test","agent_id":"123","agent_handle":"test-agent","user_message":"hello"}'
+```
+
+## Docker Environment
+
+The extension runs in a hybrid Docker setup:
+
+| Component | Location | Notes |
+|-----------|----------|-------|
+| Gateway | Host (launchctl) | Receives webhooks, spawns sandboxes |
+| Backend API | `ax-backend-api:8001` | Docker container |
+| Agent sandboxes | `clawdbot-sbx-ax-agent-{id}` | Per-agent Docker containers |
+
+```bash
+# Check running containers
+docker ps --format "table {{.Names}}\t{{.Status}}" | grep -E "(agent|clawdbot|backend)"
+
+# Check backend logs
+docker logs ax-backend-api --tail 50
+
+# Check agent sandbox logs
+docker logs clawdbot-sbx-ax-agent-{agent_id_prefix} --tail 50
+
+# Gateway logs (on host)
+tail -50 ~/.clawdbot/logs/gateway.log
+tail -20 ~/.clawdbot/logs/gateway.err.log
 ```
 
 ## Architecture
