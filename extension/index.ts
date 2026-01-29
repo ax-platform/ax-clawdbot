@@ -394,16 +394,20 @@ function createAxDispatchHandler(api: ClawdbotPluginApi) {
 
       // Validate required fields (auth_token optional for V3 which uses header auth)
       const agentHandle = payload.agent_handle || payload.agent_name;
-      if (!payload.dispatch_id || !agentHandle) {
-        api.logger.warn(`[ax-platform] Validation failed: dispatch_id=${payload.dispatch_id}, agent_handle=${agentHandle}`);
+      // Generate dispatch_id from message_id if not provided (external agents may not have it)
+      const dispatchId = payload.dispatch_id || payload.message_id || `ext-${Date.now()}`;
+      if (!agentHandle) {
+        api.logger.warn(`[ax-platform] Validation failed: agent_handle=${agentHandle}`);
         sendJson(res, 400, {
           status: "error",
-          dispatch_id: payload.dispatch_id || "unknown",
-          error: "Missing required fields: dispatch_id, agent_handle/agent_name",
+          dispatch_id: dispatchId,
+          error: "Missing required field: agent_handle/agent_name",
         } satisfies AxDispatchResponse);
         return true;
       }
-      api.logger.info(`[ax-platform] Validation passed`);
+      // Use generated dispatch_id for the rest of the flow
+      payload.dispatch_id = dispatchId;
+      api.logger.info(`[ax-platform] Validation passed (dispatch_id=${dispatchId})`);
 
       // V3 has sender_handle at top level, V2 has it nested in message
       const senderHandle = payload.sender_handle || payload.message?.sender_handle || "unknown";
@@ -465,8 +469,8 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
   }
 
   try {
-    // Session per space+sender for conversation continuity
-    const sessionId = `ax-${payload.space_id || 'default'}-${payload.sender_id || 'unknown'}`;
+    // One container per agent - agent_id is the identity
+    const sessionId = `ax-agent-${payload.agent_id || 'default'}`;
 
     // Extract just the message content (remove the "username (type): " prefix if present)
     let cleanPrompt = prompt;
