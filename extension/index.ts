@@ -23,26 +23,6 @@ import type { ClawdbotPluginApi } from "clawdbot/plugin-sdk";
 import { emptyPluginConfigSchema } from "clawdbot/plugin-sdk";
 
 // =============================================================================
-// MCP Client - Proxy calls to aX MCP endpoint
-// =============================================================================
-
-interface McpRequest {
-  jsonrpc: "2.0";
-  method: string;
-  params?: Record<string, unknown>;
-  id: number;
-}
-
-interface McpResponse {
-  jsonrpc: "2.0";
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
-  id: number;
-}
-
-let mcpRequestId = 0;
-
-// =============================================================================
 // Progress Reporting - POST updates to backend during processing
 // =============================================================================
 
@@ -85,159 +65,71 @@ async function sendProgressUpdate(
   }
 }
 
-// Token refresh on 401 - uses webhook_secret to sign refresh request
-async function refreshToken(
-  logger: ClawdbotPluginApi["logger"],
-): Promise<boolean> {
-  const endpoint = process.env.AX_MCP_ENDPOINT;
-  const agentId = process.env.AX_AGENT_ID;
-  const webhookSecret = process.env.AX_WEBHOOK_SECRET;
+// =============================================================================
+// Context Building - Build concise context from payload data
+// =============================================================================
 
-  if (!endpoint || !agentId || !webhookSecret) {
-    logger.warn("[ax-platform] Cannot refresh token: missing endpoint, agent_id, or webhook_secret");
-    return false;
-  }
+// Track which sessions have been initialized with full context
+// Only inject full context on first message to a session
+const initializedSessions = new Set<string>();
 
-  const timestamp = Math.floor(Date.now() / 1000);
-  const payload = `${agentId}.${timestamp}`;
-
-  // HMAC-SHA256 signature using webhook_secret
-  const signature = crypto
-    .createHmac("sha256", webhookSecret)
-    .update(payload)
-    .digest("hex");
-
-  logger.info("[ax-platform] Attempting token refresh...");
-
-  try {
-    // For local: use backend URL directly (on ax-shared network)
-    // For prod: derive from MCP endpoint
-    const isLocal = endpoint.includes("localhost") || endpoint.includes("pax-platform-mcp");
-    const backendUrl = isLocal
-      ? "http://pax-platform-api:8000"
-      : endpoint.replace("/mcp", "").replace("mcp.", "api.");
-
-    const response = await fetch(`${backendUrl}/api/v1/webhooks/refresh`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        agent_id: agentId,
-        timestamp: timestamp,
-        signature: signature,
-      }),
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      logger.error(`[ax-platform] Token refresh failed ${response.status}: ${text.substring(0, 200)}`);
-      return false;
-    }
-
-    const data = (await response.json()) as { token?: string; auth_token?: string };
-    const newToken = data.token || data.auth_token;
-
-    if (newToken) {
-      process.env.AX_AUTH_TOKEN = newToken;
-      logger.info("[ax-platform] Token refreshed successfully");
-      return true;
-    }
-
-    logger.error("[ax-platform] Token refresh response missing token");
-    return false;
-  } catch (err) {
-    logger.error(`[ax-platform] Token refresh error: ${err}`);
-    return false;
-  }
+interface ContextData {
+  agents?: Array<{ name: string; description?: string; type?: string }>;
+  messages?: Array<{ author: string; author_type?: string; content: string; timestamp?: string }>;
+  space_info?: { name?: string; description?: string };
 }
 
-async function callMcpTool(
-  toolName: string,
-  args: Record<string, unknown>,
-  logger: ClawdbotPluginApi["logger"],
-  retried = false,
-): Promise<unknown> {
-  const endpoint = process.env.AX_MCP_ENDPOINT;
-  const token = process.env.AX_AUTH_TOKEN;
+/**
+ * Build concise mission briefing from payload context_data.
+ * Extracts key info without dumping the full 128KB payload.
+ */
+function buildMissionBriefing(
+  agentHandle: string,
+  spaceName: string,
+  senderHandle: string,
+  contextData?: ContextData,
+): string {
+  const lines: string[] = [];
 
-  console.log(`[ax-platform] MCP tool call: ${toolName}`);
-  console.log(`[ax-platform]   endpoint: ${endpoint ? endpoint.substring(0, 50) : 'MISSING'}`);
-  console.log(`[ax-platform]   token: ${token ? token.substring(0, 20) + '...' : 'MISSING'}`);
+  // Identity
+  lines.push(`# You Are: ${agentHandle}`);
+  lines.push('');
+  lines.push(`**Space:** ${spaceName}`);
+  lines.push(`**Responding to:** @${senderHandle}`);
+  lines.push('');
 
-  if (!endpoint || !token) {
-    logger.warn("[ax-platform] MCP call failed: missing endpoint or token");
-    return { error: "MCP not configured - missing endpoint or auth token" };
+  // Active collaborators (limit to 10)
+  if (contextData?.agents && contextData.agents.length > 0) {
+    lines.push('## Active Collaborators');
+    for (const agent of contextData.agents.slice(0, 10)) {
+      const typeIcon = agent.type === 'sentinel' ? '🛡️' : agent.type === 'assistant' ? '🤖' : '👤';
+      const desc = agent.description ? ` - ${agent.description.substring(0, 80)}` : '';
+      lines.push(`- @${agent.name} ${typeIcon}${desc}`);
+    }
+    lines.push('');
   }
 
-  const request: McpRequest = {
-    jsonrpc: "2.0",
-    method: "tools/call",
-    params: {
-      name: toolName,
-      arguments: args,
-    },
-    id: ++mcpRequestId,
-  };
-
-  logger.info(`[ax-platform] MCP call: ${toolName} -> ${endpoint}`);
-
-  try {
-    const response = await fetch(`${endpoint}/mcp`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(request),
-    });
-
-    // On 401, try to refresh token and retry once
-    if (response.status === 401 && !retried) {
-      logger.warn("[ax-platform] Got 401, attempting token refresh...");
-      const refreshed = await refreshToken(logger);
-      if (refreshed) {
-        logger.info("[ax-platform] Retrying MCP call with new token...");
-        return callMcpTool(toolName, args, logger, true);
-      }
-      return { error: "Token expired and refresh failed" };
+  // Recent conversation (last 10 messages, truncated)
+  if (contextData?.messages && contextData.messages.length > 0) {
+    lines.push('## Recent Conversation');
+    const recentMessages = contextData.messages.slice(-10);
+    for (const msg of recentMessages) {
+      const authorType = msg.author_type === 'agent' ? '🤖' : '👤';
+      const content = msg.content.length > 200
+        ? msg.content.substring(0, 200) + '...'
+        : msg.content;
+      lines.push(`${authorType} @${msg.author}: ${content}`);
     }
-
-    if (!response.ok) {
-      const text = await response.text();
-      logger.error(`[ax-platform] MCP HTTP error ${response.status}: ${text.substring(0, 200)}`);
-      return { error: `MCP request failed: ${response.status}` };
-    }
-
-    const mcpResponse = (await response.json()) as McpResponse;
-
-    if (mcpResponse.error) {
-      logger.error(`[ax-platform] MCP error: ${mcpResponse.error.message}`);
-      return { error: mcpResponse.error.message };
-    }
-
-    logger.info(`[ax-platform] MCP success: ${toolName}`);
-    return mcpResponse.result;
-  } catch (err) {
-    logger.error(`[ax-platform] MCP fetch error: ${err}`);
-    return { error: `MCP network error: ${err}` };
+    lines.push('');
   }
-}
 
-// Helper to format MCP result for display
-function formatMcpResult(result: unknown): string {
-  if (typeof result === "string") return result;
-  if (result && typeof result === "object") {
-    // Handle content array format from MCP
-    const r = result as Record<string, unknown>;
-    if (Array.isArray(r.content)) {
-      return r.content
-        .map((c: { type?: string; text?: string }) => c.text || JSON.stringify(c))
-        .join("\n");
-    }
-    return JSON.stringify(result, null, 2);
-  }
-  return String(result);
+  // Instructions
+  lines.push('## Instructions');
+  lines.push(`- Start your reply with @${senderHandle}`);
+  lines.push('- Be helpful and conversational');
+  lines.push('- @mention other agents to collaborate');
+
+  return lines.join('\n');
 }
 
 // =============================================================================
@@ -683,20 +575,27 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
       cleanPrompt = prompt.substring(prefixMatch[0].length).trim();
     }
 
-    // Build context block from aX system_prompt or fallback to simple context
-    // Always include reply instruction to @mention the sender
-    const replyInstruction = `\n\nIMPORTANT: Always start your reply with @${sender} to mention who you're responding to.\n`;
+    // Build context from payload data
+    // Only inject full context on FIRST message to a session
+    // Subsequent messages just include the user message (session has context)
+    const agentHandle = payload.agent_handle || payload.agent_name || 'agent';
+    const spaceName = payload.space_name || 'aX';
 
-    let contextBlock: string;
-    if (payload.system_prompt) {
-      // Use the full aX system prompt which includes identity, platform context, chat history
-      contextBlock = `<ax-context>\n${payload.system_prompt}${replyInstruction}</ax-context>\n\nUser message: `;
+    let promptWithContext: string;
+    const isNewSession = !initializedSessions.has(sessionId);
+
+    if (isNewSession) {
+      // First message to this session - inject full context
+      const contextData = (payload as Record<string, unknown>).context_data as ContextData | undefined;
+      const missionBriefing = buildMissionBriefing(agentHandle, spaceName, sender, contextData);
+      promptWithContext = `<ax-context>\n${missionBriefing}</ax-context>\n\nMessage from @${sender}: ${cleanPrompt}`;
+      initializedSessions.add(sessionId);
+      api.logger.info(`[ax-platform] New session - injecting full context (${promptWithContext.length} chars, agents: ${contextData?.agents?.length || 0})`);
     } else {
-      // Fallback: simple sender context
-      const senderType = payload.sender_type || 'unknown';
-      contextBlock = `[From @${sender} (${senderType}) in ${payload.space_name || 'aX'}]${replyInstruction}`;
+      // Existing session - just send the message with sender info
+      promptWithContext = `@${sender}: ${cleanPrompt}`;
+      api.logger.info(`[ax-platform] Existing session - minimal context (${promptWithContext.length} chars)`);
     }
-    const promptWithContext = contextBlock + cleanPrompt;
 
     api.logger.info(`[ax-platform] Calling moltbot agent with session ${sessionId}...`);
 
