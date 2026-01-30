@@ -576,25 +576,35 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
     }
 
     // Build context from payload data
-    // Only inject full context on FIRST message to a session
-    // Subsequent messages just include the user message (session has context)
+    // Full roster injection on FIRST message, but ALWAYS include sender/space context
     const agentHandle = payload.agent_handle || payload.agent_name || 'agent';
     const spaceName = payload.space_name || 'aX';
+    const spaceId = payload.space_id || '';
+
+    // Key sessions by agent + space to handle multi-space scenarios
+    const sessionKey = `${sessionId}-${spaceId}`;
+    const isNewSession = !initializedSessions.has(sessionKey);
 
     let promptWithContext: string;
-    const isNewSession = !initializedSessions.has(sessionId);
+
+    // Always include essential context (sender, space, reply instruction)
+    const essentialContext = [
+      `You are ${agentHandle} in space "${spaceName}".`,
+      `Replying to @${sender}.`,
+      `Start your response with @${sender}.`,
+    ].join(' ');
 
     if (isNewSession) {
-      // First message to this session - inject full context
+      // First message to this session+space - inject full context including roster
       const contextData = (payload as Record<string, unknown>).context_data as ContextData | undefined;
       const missionBriefing = buildMissionBriefing(agentHandle, spaceName, sender, contextData);
       promptWithContext = `<ax-context>\n${missionBriefing}</ax-context>\n\nMessage from @${sender}: ${cleanPrompt}`;
-      initializedSessions.add(sessionId);
-      api.logger.info(`[ax-platform] New session - injecting full context (${promptWithContext.length} chars, agents: ${contextData?.agents?.length || 0})`);
+      initializedSessions.add(sessionKey);
+      api.logger.info(`[ax-platform] New session - full context (${promptWithContext.length} chars, agents: ${contextData?.agents?.length || 0})`);
     } else {
-      // Existing session - just send the message with sender info
-      promptWithContext = `@${sender}: ${cleanPrompt}`;
-      api.logger.info(`[ax-platform] Existing session - minimal context (${promptWithContext.length} chars)`);
+      // Existing session - include essential context + message (fixes wrong @mention bug)
+      promptWithContext = `[${essentialContext}]\n\n@${sender}: ${cleanPrompt}`;
+      api.logger.info(`[ax-platform] Existing session - essential context (${promptWithContext.length} chars)`);
     }
 
     api.logger.info(`[ax-platform] Calling moltbot agent with session ${sessionId}...`);
@@ -729,14 +739,34 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
         const json = JSON.parse(jsonStr);
         api.logger.info(`[ax-platform] Parsed JSON keys: ${Object.keys(json).join(', ')}`);
 
+        // Log session health from meta - critical for debugging bloat
+        if (json.meta?.agentMeta?.usage) {
+          const usage = json.meta.agentMeta.usage;
+          const cacheRead = usage.cacheRead || 0;
+          const input = usage.input || 0;
+          const output = usage.output || 0;
+          api.logger.info(`[ax-platform] Session tokens - cache: ${cacheRead}, input: ${input}, output: ${output}`);
+
+          // Warn if session is getting bloated (>100K cached tokens)
+          if (cacheRead > 100000) {
+            api.logger.warn(`[ax-platform] SESSION BLOAT WARNING: ${cacheRead} cached tokens - consider session reset`);
+          }
+        }
+
         // Extract text from payloads array
         if (json.payloads && Array.isArray(json.payloads)) {
           api.logger.info(`[ax-platform] Found payloads array with ${json.payloads.length} items`);
 
           // Handle empty payloads - agent processed but produced no output
           if (json.payloads.length === 0) {
-            api.logger.warn(`[ax-platform] Empty payloads array - agent produced no text output`);
-            return "I processed your message but didn't generate a response. Please try again or rephrase your request.";
+            const cacheRead = json.meta?.agentMeta?.usage?.cacheRead || 0;
+            api.logger.warn(`[ax-platform] Empty payloads - cache: ${cacheRead} tokens, output: ${json.meta?.agentMeta?.usage?.output || 0}`);
+
+            // If session is bloated, suggest the issue
+            if (cacheRead > 50000) {
+              return `@${sender} I'm having trouble responding - my session history may be too large (${Math.round(cacheRead/1000)}K tokens). Please try again or ask an admin to reset my session.`;
+            }
+            return `@${sender} I processed your message but couldn't generate a response. Please try rephrasing your request.`;
           }
 
           if (json.payloads[0]?.text) {
@@ -768,7 +798,7 @@ async function processDispatch(api: ClawdbotPluginApi, payload: AxDispatchPayloa
     });
     const cleanOutput = cleanLines.join('\n').trim();
 
-    return cleanOutput || output || "I processed your message but have no response.";
+    return cleanOutput || output || `@${sender} I processed your message but have no response.`;
   } catch (err) {
     api.logger.error(`[ax-platform] Agent error: ${err}`);
     return `Hello @${sender}! I received your message but encountered an error processing it. Please try again.`;
