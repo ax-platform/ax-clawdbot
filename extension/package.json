@@ -1,9 +1,21 @@
 {
-  "name": "@ax-platform/clawdbot",
-  "version": "0.1.0",
-  "description": "Connect your local Clawdbot agent to aX Platform",
+  "name": "ax-platform",
+  "version": "0.2.0",
+  "description": "Connect your local Moltbot agent to aX Platform",
   "main": "index.ts",
-  "keywords": ["clawdbot", "ax", "agent", "mcp", "webhook"],
+  "type": "module",
+  "clawdbot": {
+    "extensions": ["./index.ts"],
+    "hooks": ["./hooks/ax-bootstrap"]
+  },
+  "keywords": [
+    "moltbot",
+    "clawdbot",
+    "ax",
+    "agent",
+    "plugin",
+    "channel"
+  ],
   "author": "aX Platform",
   "license": "MIT",
   "repository": {
@@ -11,6 +23,9 @@
     "url": "https://github.com/ax-platform/ax-clawdbot"
   },
   "peerDependencies": {
-    "clawdbot": ">=2026.1.0"
+    "clawdbot": "*"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.32.0"
   }
 }
