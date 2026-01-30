@@ -83,69 +83,37 @@ const plugin = {
     api.registerTool(axAgentsTool, { optional: true });
     api.logger.info("[ax-platform] Tools registered: ax_messages, ax_tasks, ax_context, ax_agents");
 
-    // Try to register before_agent_start hook for context injection
-    // Using (api as any) to bypass TypeScript interface limitations
-    const apiAny = api as any;
-    if (typeof apiAny.registerHook === "function") {
-      apiAny.registerHook("before_agent_start", async (run: any) => {
-        const sessionKey = run.sessionKey;
-        if (!sessionKey?.startsWith("ax-agent-")) {
-          return; // Not an aX session
-        }
+    // Register before_agent_start hook for context injection
+    // Uses api.on() event pattern (like memory-lancedb plugin)
+    // Returns { prependContext: "..." } to inject into agent context
+    api.on("before_agent_start", async (event: any) => {
+      const sessionKey = event.sessionKey;
+      if (!sessionKey?.startsWith("ax-agent-")) {
+        return; // Not an aX session
+      }
 
-        const session = getDispatchSession(sessionKey);
-        if (!session) {
-          return; // No context available
-        }
+      const session = getDispatchSession(sessionKey);
+      if (!session) {
+        api.logger.warn(`[ax-platform] No session found for ${sessionKey}`);
+        return; // No context available
+      }
 
-        // Build and inject mission briefing
-        const briefing = buildMissionBriefing(
-          session.agentHandle,
-          session.spaceName,
-          session.senderHandle,
-          session.contextData
-        );
+      // Build mission briefing with agent identity
+      const briefing = buildMissionBriefing(
+        session.agentHandle,
+        session.spaceName,
+        session.senderHandle,
+        session.contextData
+      );
 
-        // Prepend to system prompt
-        if (run.systemPrompt !== undefined) {
-          run.systemPrompt = `${briefing}\n\n---\n\n${run.systemPrompt || ""}`;
-        }
+      api.logger.info(`[ax-platform] Injecting mission briefing for ${sessionKey} (agent: ${session.agentHandle})`);
 
-        // Also add as context file if supported
-        if (Array.isArray(run.contextFiles)) {
-          run.contextFiles.push({
-            name: "AX_MISSION.md",
-            content: briefing,
-          });
-        }
-
-        api.logger.info(`[ax-platform] Injected mission briefing for ${sessionKey}`);
-      });
-      api.logger.info("[ax-platform] Hook registered: before_agent_start");
-    } else if (typeof apiAny.on === "function") {
-      // Fallback: try event emitter pattern
-      apiAny.on("before_agent_start", async (run: any) => {
-        const sessionKey = run.sessionKey;
-        if (!sessionKey?.startsWith("ax-agent-")) return;
-        const session = getDispatchSession(sessionKey);
-        if (!session) return;
-
-        const briefing = buildMissionBriefing(
-          session.agentHandle,
-          session.spaceName,
-          session.senderHandle,
-          session.contextData
-        );
-
-        if (run.systemPrompt !== undefined) {
-          run.systemPrompt = `${briefing}\n\n---\n\n${run.systemPrompt || ""}`;
-        }
-        api.logger.info(`[ax-platform] Injected mission briefing for ${sessionKey}`);
-      });
-      api.logger.info("[ax-platform] Hook registered via event emitter: before_agent_start");
-    } else {
-      api.logger.info("[ax-platform] Hooks: no registration method available (registerHook or on)");
-    }
+      // Return prependContext to inject into the agent's context
+      return {
+        prependContext: briefing,
+      };
+    });
+    api.logger.info("[ax-platform] Hook registered: before_agent_start (via api.on)");
 
     // Register HTTP handler for /ax/dispatch
     const dispatchHandler = createDispatchHandler(api, config);

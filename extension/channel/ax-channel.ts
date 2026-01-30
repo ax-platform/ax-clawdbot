@@ -180,11 +180,13 @@ export function createDispatchHandler(
         spaceId: payload.space_id || "",
         spaceName: payload.space_name || "aX",
         senderHandle: payload.sender_handle || "unknown",
+        senderType: payload.sender_type, // "cloud_agent" | "user" | "mcp_agent"
         authToken: payload.auth_token || "",
         mcpEndpoint: payload.mcp_endpoint,
         contextData: payload.context_data,
         startTime: Date.now(),
       };
+      api.logger.info(`[ax-platform] Sender: @${session.senderHandle} (type: ${session.senderType || 'undefined'})`);
       dispatchSessions.set(sessionKey, session);
 
       // Extract message
@@ -199,13 +201,18 @@ export function createDispatchHandler(
         sendProgressUpdate(backendUrl, payload.auth_token, dispatchId, "processing", "thinking");
       }
 
-      // Build context for the agent
+      // Build context for the agent (identity, collaborators, recent conversation)
       const missionBriefing = buildMissionBriefing(
         session.agentHandle,
         session.spaceName,
         session.senderHandle,
+        session.senderType,
         session.contextData
       );
+
+      // Prepend mission briefing to the message so the agent sees it in context
+      // This ensures the agent knows its identity even in sandboxed mode
+      const messageWithContext = `${missionBriefing}\n\n---\n\n**Current Message:**\n${message}`;
 
       // Get runtime for agent execution
       const runtime = getAxPlatformRuntime();
@@ -213,7 +220,7 @@ export function createDispatchHandler(
       // Build context payload (matching BlueBubbles pattern)
       const ctxPayload = {
         Body: message,
-        BodyForAgent: message,
+        BodyForAgent: messageWithContext, // Include mission briefing in agent context
         RawBody: message,
         CommandBody: message,
         BodyForCommands: message,

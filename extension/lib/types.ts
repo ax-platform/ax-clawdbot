@@ -75,6 +75,7 @@ export interface DispatchSession {
   spaceId: string;
   spaceName: string;
   senderHandle: string;
+  senderType?: string; // "cloud_agent" | "user" | "mcp_agent"
   authToken: string;
   mcpEndpoint?: string;
   contextData?: ContextData;
