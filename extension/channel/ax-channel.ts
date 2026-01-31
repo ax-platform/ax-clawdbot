@@ -364,9 +364,11 @@ export function createDispatchHandler(
       // Collect response text
       let responseText = "";
       let deliverCallCount = 0;
+      let lastError: string | null = null;
 
       api.logger.info(`[ax-platform] Calling dispatcher for session ${sessionKey}...`);
       api.logger.info(`[ax-platform] Message length: ${message.length} chars, context: ${missionBriefing.length} chars`);
+      api.logger.info(`[ax-platform] Sender: ${session.senderHandle} (${session.senderType || 'unknown'})`);
       const startTime = Date.now();
 
       // Dispatch to agent - this runs the agent and calls deliver() with response
@@ -385,6 +387,7 @@ export function createDispatchHandler(
           onError: (err: unknown, info: { kind: string }) => {
             const elapsed = Date.now() - startTime;
             api.logger.error(`[ax-platform] Agent error at ${elapsed}ms (${info.kind}): ${err}`);
+            lastError = `${info.kind}: ${err}`;
           },
         },
       });
@@ -393,7 +396,16 @@ export function createDispatchHandler(
       api.logger.info(`[ax-platform] Dispatcher complete in ${elapsed}ms, deliver calls: ${deliverCallCount}, response: ${responseText.length} chars`);
 
       if (!responseText) {
-        api.logger.warn(`[ax-platform] WARNING: Empty response after ${elapsed}ms and ${deliverCallCount} deliver() calls`);
+        if (deliverCallCount === 0) {
+          // Agent completed but deliver() was never called - likely early termination
+          api.logger.warn(`[ax-platform] WARNING: Agent terminated without calling deliver() after ${elapsed}ms`);
+          if (lastError) {
+            api.logger.warn(`[ax-platform] Last error: ${lastError}`);
+          }
+          api.logger.warn(`[ax-platform] This may indicate the agent refused to respond or hit a stop condition`);
+        } else {
+          api.logger.warn(`[ax-platform] WARNING: Empty response after ${elapsed}ms and ${deliverCallCount} deliver() calls`);
+        }
       }
 
       // Clean up dispatch context after a grace period (allows hooks/tools to complete)
@@ -402,8 +414,21 @@ export function createDispatchHandler(
         sessionKeyIndex.delete(sessionKey);
       }, SESSION_CLEANUP_DELAY_MS);
 
-      // Return response
-      const finalResponse = responseText || "[No response from agent]";
+      // Return response with better error context
+      // Note: NO_REPLY is a valid Clawdbot convention - the agent chose not to respond
+      // In this case, deliver() is never called because NO_REPLY is filtered out
+      let finalResponse: string;
+      if (responseText) {
+        finalResponse = responseText;
+      } else if (lastError) {
+        finalResponse = `[Agent error: ${lastError}]`;
+      } else if (deliverCallCount === 0) {
+        // Agent completed but nothing to deliver - likely NO_REPLY (silent response)
+        // This is valid behavior - the agent chose not to respond
+        finalResponse = "";  // Empty response = agent chose silence
+      } else {
+        finalResponse = "[No response from agent]";
+      }
       api.logger.info(`[ax-platform] Sending: ${finalResponse.substring(0, LOG_PREVIEW_LENGTH)}${finalResponse.length > LOG_PREVIEW_LENGTH ? '...' : ''}`);
       sendJson(res, 200, {
         status: "success",
