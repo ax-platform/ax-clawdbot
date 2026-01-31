@@ -306,13 +306,13 @@ export function createDispatchHandler(
       // Deduplication check - handle based on dispatch state
       const dispatchState = checkDispatchState(dispatchId);
       if (dispatchState.status === "in_progress") {
-        // Retry arrived while still processing - agent is working on it
-        const elapsedMin = Math.floor((dispatchState.elapsedMs || 0) / 60000);
-        api.logger.warn(`[ax-platform] Dispatch ${dispatchId} still in progress (${elapsedMin}m) - asking backend to wait`);
+        // Retry arrived while still processing - return empty so no message is created
+        const elapsedSec = Math.floor((dispatchState.elapsedMs || 0) / 1000);
+        api.logger.info(`[ax-platform] Dispatch ${dispatchId} still in progress (${elapsedSec}s) - returning empty to suppress message`);
         sendJson(res, 200, {
           status: "success",
           dispatch_id: dispatchId,
-          response: `[Agent still processing - ${elapsedMin}m elapsed, please wait]`,
+          response: "", // Empty = no message created, backend keeps retrying
         } satisfies AxDispatchResponse);
         return true;
       }
