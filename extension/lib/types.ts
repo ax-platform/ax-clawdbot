@@ -43,10 +43,17 @@ export interface ContextData {
     author_type?: string;
     content: string;
     timestamp?: string;
+    message_id?: string; // For fetching full content if needed
   }>;
   space_info?: {
     name?: string;
     description?: string;
+  };
+  // Metadata about context completeness
+  thread_info?: {
+    total_messages?: number;
+    first_message_timestamp?: string;
+    has_more?: boolean;
   };
 }
 
