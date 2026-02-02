@@ -30,6 +30,10 @@ export interface AxDispatchPayload {
     ax_mcp?: boolean;
     image_generation?: boolean;
   };
+  // Async dispatch callback URLs (new in Stage 2)
+  heartbeat_url?: string;
+  callback_url?: string;
+  callback_api_key?: string;
 }
 
 /**

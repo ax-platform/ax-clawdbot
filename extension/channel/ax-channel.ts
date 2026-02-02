@@ -98,6 +98,11 @@ function stopPeriodicCleanup(): void {
 // Backend default is 30s, so any retry means we already exceeded the limit
 const BACKEND_TIMEOUT_MS = 30 * 1000; // 30 seconds
 
+// Async dispatch callback settings
+const HEARTBEAT_INTERVAL_MS = 30 * 1000; // 30 seconds (rich progress)
+const CALLBACK_RETRY_COUNT = 3;
+const CALLBACK_RETRY_DELAY_MS = 1000; // 1 second between retries
+
 /**
  * Check dispatch state for deduplication
  * Returns: "new" | "in_progress" | "timed_out" | "completed"
@@ -137,6 +142,262 @@ function markDispatchCompleted(dispatchId: string, response: string): void {
     state.status = "completed";
     state.response = response;
   }
+}
+
+/**
+ * Send heartbeat to backend callback URL
+ * Returns true if successful, false otherwise
+ */
+async function sendHeartbeat(
+  heartbeatUrl: string,
+  authToken: string,
+  payload: {
+    agent_name?: string;
+    agent_id: string;
+    org_id?: string;
+    message_id?: string;
+    progress: string;
+    percent_complete?: number;
+    tokens_used?: number;
+    current_tool?: string;
+    elapsed_ms?: number;
+  },
+  logger: { info: (msg: string) => void; error: (msg: string) => void }
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= CALLBACK_RETRY_COUNT; attempt++) {
+    try {
+      const response = await fetch(heartbeatUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": authToken,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (response.ok) {
+        return true;
+      }
+      logger.error(`[ax-platform] Heartbeat failed (attempt ${attempt}): ${response.status} ${response.statusText}`);
+    } catch (err) {
+      logger.error(`[ax-platform] Heartbeat error (attempt ${attempt}): ${err}`);
+    }
+    if (attempt < CALLBACK_RETRY_COUNT) {
+      await new Promise(r => setTimeout(r, CALLBACK_RETRY_DELAY_MS));
+    }
+  }
+  return false;
+}
+
+/**
+ * Send completion callback to backend
+ * Returns true if successful, false otherwise
+ */
+async function sendCompletion(
+  callbackUrl: string,
+  authToken: string,
+  payload: {
+    agent_name?: string;
+    agent_id?: string;
+    org_id?: string;
+    message_id?: string;
+    completion_status: "success" | "failed";
+    response?: string;
+    error?: string;
+    total_tokens?: number;
+    total_tool_calls?: number;
+    elapsed_ms?: number;
+  },
+  logger: { info: (msg: string) => void; error: (msg: string) => void }
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= CALLBACK_RETRY_COUNT; attempt++) {
+    try {
+      const response = await fetch(callbackUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": authToken,
+        },
+        body: JSON.stringify(payload),
+      });
+      if (response.ok) {
+        logger.info(`[ax-platform] Completion callback sent successfully`);
+        return true;
+      }
+      logger.error(`[ax-platform] Completion callback failed (attempt ${attempt}): ${response.status} ${response.statusText}`);
+    } catch (err) {
+      logger.error(`[ax-platform] Completion callback error (attempt ${attempt}): ${err}`);
+    }
+    if (attempt < CALLBACK_RETRY_COUNT) {
+      await new Promise(r => setTimeout(r, CALLBACK_RETRY_DELAY_MS));
+    }
+  }
+  return false;
+}
+
+/**
+ * Process dispatch asynchronously with heartbeats and completion callback
+ * This is the "Stage 2" async mode that prevents Cloud Tasks timeouts
+ */
+async function processDispatchAsync(
+  payload: AxDispatchPayload,
+  session: DispatchSession,
+  sessionKey: string,
+  message: string,
+  agent: { handle?: string; env?: string },
+  api: {
+    logger: { info: (msg: string) => void; warn: (msg: string) => void; error: (msg: string) => void };
+    config?: unknown;
+  },
+  backendUrl: string
+): Promise<void> {
+  const dispatchId = payload.dispatch_id || session.dispatchId;
+  const startTime = Date.now();
+
+  api.logger.info(`[ax-platform] ASYNC: Starting background processing for ${dispatchId.substring(0, 8)}`);
+
+  // Start heartbeat timer
+  let heartbeatCount = 0;
+  const heartbeatTimer = setInterval(async () => {
+    heartbeatCount++;
+    const elapsedMs = Date.now() - startTime;
+    api.logger.info(`[ax-platform] ASYNC: Sending heartbeat #${heartbeatCount} (${Math.round(elapsedMs / 1000)}s elapsed)`);
+
+    if (payload.heartbeat_url && payload.callback_api_key) {
+      await sendHeartbeat(
+        payload.heartbeat_url,
+        payload.callback_api_key,
+        {
+          agent_name: session.agentHandle,
+          agent_id: session.agentId,
+          org_id: session.spaceId,
+          message_id: payload.message_id,
+          progress: `Processing... (${Math.round(elapsedMs / 1000)}s)`,
+          elapsed_ms: elapsedMs,
+        },
+        api.logger
+      );
+    }
+  }, HEARTBEAT_INTERVAL_MS);
+
+  // Build context for the agent
+  const missionBriefing = buildMissionBriefing(
+    session.agentHandle,
+    session.spaceName,
+    session.senderHandle,
+    session.senderType,
+    session.contextData
+  );
+  const messageWithContext = `${missionBriefing}\n\n---\n\n**Current Message:**\n${message}`;
+
+  // Build context payload
+  const ctxPayload = {
+    Body: message,
+    BodyForAgent: messageWithContext,
+    RawBody: message,
+    CommandBody: message,
+    BodyForCommands: message,
+    From: `ax-platform:${session.senderHandle}`,
+    To: `ax-platform:${session.agentHandle}`,
+    SessionKey: sessionKey,
+    AccountId: "default",
+    ChatType: "direct" as const,
+    ConversationLabel: `${session.agentHandle} [${session.spaceName}]${agent.env ? ` (${agent.env})` : ''}`,
+    SenderId: session.senderHandle,
+    Provider: "ax-platform",
+    Surface: "ax-platform",
+    OriginatingChannel: "ax-platform",
+    OriginatingTo: `ax-platform:${session.agentHandle}`,
+    WasMentioned: true,
+    CommandAuthorized: true,
+    AxDispatchId: dispatchId,
+    AxSpaceId: session.spaceId,
+    AxSpaceName: session.spaceName,
+    AxAuthToken: session.authToken,
+    AxMcpEndpoint: session.mcpEndpoint,
+    SystemContext: missionBriefing,
+  };
+
+  // Collect response
+  let responseText = "";
+  let deliverCallCount = 0;
+  let lastError: string | null = null;
+
+  try {
+    const runtime = getAxPlatformRuntime();
+
+    // Dispatch to agent
+    await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx: ctxPayload,
+      cfg: api.config,
+      dispatcherOptions: {
+        deliver: async (deliverPayload: { text?: string; mediaUrls?: string[] }) => {
+          deliverCallCount++;
+          if (deliverPayload.text) {
+            responseText += deliverPayload.text;
+          }
+        },
+        onError: (err: unknown, info: { kind: string }) => {
+          api.logger.error(`[ax-platform] ASYNC: Agent error (${info.kind}): ${err}`);
+          lastError = `${info.kind}: ${err}`;
+        },
+      },
+    });
+  } catch (err) {
+    api.logger.error(`[ax-platform] ASYNC: Dispatch error: ${err}`);
+    lastError = String(err);
+  } finally {
+    // Stop heartbeat timer
+    clearInterval(heartbeatTimer);
+  }
+
+  const elapsed = Date.now() - startTime;
+  api.logger.info(`[ax-platform] ASYNC: Processing complete in ${elapsed}ms, deliver calls: ${deliverCallCount}, response: ${responseText.length} chars`);
+
+  // Determine final response
+  let finalResponse: string;
+  let completionStatus: "success" | "failed" = "success";
+
+  if (responseText) {
+    finalResponse = responseText;
+  } else if (lastError) {
+    finalResponse = `[Agent error: ${lastError}]`;
+    completionStatus = "failed";
+  } else if (deliverCallCount === 0) {
+    finalResponse = "[Agent chose not to respond]";
+  } else {
+    finalResponse = "[No response from agent]";
+  }
+
+  // Mark dispatch as completed
+  markDispatchCompleted(dispatchId, finalResponse);
+
+  // Send completion callback
+  if (payload.callback_url && payload.callback_api_key) {
+    api.logger.info(`[ax-platform] ASYNC: Sending completion callback`);
+    await sendCompletion(
+      payload.callback_url,
+      payload.callback_api_key,
+      {
+        agent_name: payload.agent_name || payload.agent_handle,
+        agent_id: payload.agent_id,
+        org_id: payload.org_id,
+        message_id: payload.message_id,
+        completion_status: completionStatus,
+        response: finalResponse,
+        error: lastError || undefined,
+        elapsed_ms: elapsed,
+      },
+      api.logger
+    );
+  } else {
+    api.logger.warn(`[ax-platform] ASYNC: No callback_url or callback_api_key, response may be lost!`);
+  }
+
+  // Clean up session
+  setTimeout(() => {
+    dispatchSessions.delete(dispatchId);
+    sessionKeyIndex.delete(sessionKey);
+  }, SESSION_CLEANUP_DELAY_MS);
 }
 
 /**
@@ -394,6 +655,40 @@ export function createDispatchHandler(
         sendJson(res, 400, { status: "error", dispatch_id: dispatchId, error: "No message content" });
         return true;
       }
+
+      // ============================================================
+      // ASYNC MODE: If callback_url is present, ACK immediately and
+      // process in background. This prevents Cloud Tasks timeouts.
+      // ============================================================
+      if (payload.callback_url) {
+        api.logger.info(`[ax-platform] ASYNC MODE: callback_url detected, ACKing immediately`);
+
+        // ACK immediately to Cloud Tasks
+        sendJson(res, 200, {
+          status: "accepted",
+          dispatch_id: dispatchId,
+          mode: "async"
+        });
+
+        // Process in background (fire and forget)
+        processDispatchAsync(
+          payload,
+          session,
+          sessionKey,
+          message,
+          agent,
+          api,
+          backendUrl
+        ).catch(err => {
+          api.logger.error(`[ax-platform] Async dispatch failed: ${err}`);
+        });
+
+        return true;
+      }
+      // ============================================================
+      // SYNC MODE: Fallback for backends without callback_url
+      // (backward compatible with existing behavior)
+      // ============================================================
 
       // Send progress update
       if (payload.auth_token) {
