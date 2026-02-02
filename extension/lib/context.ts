@@ -9,7 +9,7 @@
  * 5. Think about the NEXT webhook agent - make this experience fluid
  */
 
-import type { ContextData } from "./types.js";
+import type { ContextData, Message } from "./types.js";
 
 // Configuration - can be overridden per-agent in the future
 const DEFAULT_CONFIG = {
@@ -27,13 +27,11 @@ const DEFAULT_CONFIG = {
   maxAgents: 15,
 };
 
-interface Message {
-  author: string;
-  author_type?: string;
-  content: string;
-  timestamp?: string;
-  message_id?: string;
-}
+// When truncating, try to break at word boundary if we're past this ratio
+const WORD_BOUNDARY_THRESHOLD = 0.8;
+
+// Fallback for empty message content
+const EMPTY_MESSAGE_FALLBACK = "(empty message)";
 
 /**
  * Format a single message for the context
@@ -48,18 +46,17 @@ function formatMessage(
     ? ` (${formatRelativeTime(msg.timestamp)})` 
     : "";
   
-  let content = msg.content;
-  let wasTruncated = false;
+  // Handle empty or missing content
+  let content = msg.content?.trim() || EMPTY_MESSAGE_FALLBACK;
   
   if (content.length > maxChars) {
     content = content.substring(0, maxChars).trim();
-    // Try to break at a word boundary
+    // Try to break at a word boundary if we're past the threshold
     const lastSpace = content.lastIndexOf(" ");
-    if (lastSpace > maxChars * 0.8) {
+    if (lastSpace > maxChars * WORD_BOUNDARY_THRESHOLD) {
       content = content.substring(0, lastSpace);
     }
     content += " [...]";
-    wasTruncated = true;
   }
   
   // Preserve line breaks but collapse excessive whitespace
@@ -86,7 +83,8 @@ function formatRelativeTime(isoTimestamp: string): string {
     
     const diffDays = Math.floor(diffHours / 24);
     return `${diffDays}d ago`;
-  } catch {
+  } catch (err) {
+    console.warn(`[ax-platform] Failed to parse timestamp "${isoTimestamp}":`, err);
     return "";
   }
 }
@@ -127,14 +125,15 @@ export function buildMissionBriefing(
     lines.push("## Other Agents in This Space");
     lines.push("These are OTHER agents you can @mention to collaborate with:");
     
-    const otherAgents = contextData.agents
-      .filter(agent => {
-        const handle = `@${agent.name}`;
-        return handle !== agentHandle && agent.name !== agentHandle.replace("@", "");
-      })
-      .slice(0, config.maxAgents);
+    // Filter out self first, then slice
+    const otherAgents = contextData.agents.filter(agent => {
+      const handle = `@${agent.name}`;
+      return handle !== agentHandle && agent.name !== agentHandle.replace("@", "");
+    });
     
-    for (const agent of otherAgents) {
+    const displayedAgents = otherAgents.slice(0, config.maxAgents);
+    
+    for (const agent of displayedAgents) {
       const typeIcon = agent.type === "sentinel" ? "🛡️" 
         : agent.type === "assistant" ? "🤖" 
         : "👤";
@@ -148,10 +147,10 @@ export function buildMissionBriefing(
       lines.push(`- @${agent.name} ${typeIcon}${desc}`);
     }
     
-    // Note if agents were omitted
-    const totalOthers = contextData.agents.length - 1; // minus self
-    if (totalOthers > config.maxAgents) {
-      lines.push(`- *(${totalOthers - config.maxAgents} more agents in space)*`);
+    // Note if agents were omitted - use filtered array length
+    const omittedCount = otherAgents.length - displayedAgents.length;
+    if (omittedCount > 0) {
+      lines.push(`- *(${omittedCount} more agents in space)*`);
     }
     lines.push("");
   }
