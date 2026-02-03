@@ -9,7 +9,7 @@
  */
 
 import type { PluginRuntime } from "clawdbot/plugin-sdk";
-import { getDispatchSessionById } from "../channel/ax-channel.js";
+import { getDispatchSession } from "../channel/ax-channel.js";
 
 // Backend URL for progress endpoint
 const BACKEND_URL = process.env.AX_BACKEND_URL || "https://api.paxai.app";
@@ -53,19 +53,29 @@ Best-effort: failures are silent and won't interrupt your work.`,
       const logger = runtime.logger;
 
       // Get dispatch context
-      const dispatchId = context.AxDispatchId;
-      const authToken = context.AxAuthToken;
+      let dispatchId = context.AxDispatchId;
+      let authToken = context.AxAuthToken;
 
       if (!dispatchId || !authToken) {
         // Try to get from session
         const session = context.sessionKey 
-          ? getDispatchSessionById(context.sessionKey)
+          ? getDispatchSession(context.sessionKey)
           : undefined;
         
         if (!session) {
           logger.info("[ax_progress] No dispatch context - skipping progress update");
           return { ok: true, skipped: true, reason: "No dispatch context" };
         }
+        
+        // Extract missing values from session
+        if (!dispatchId) dispatchId = session.dispatchId;
+        if (!authToken) authToken = session.authToken;
+      }
+      
+      // Validate percent if provided
+      if (params.percent !== undefined && (params.percent < 0 || params.percent > 100)) {
+        logger.warn(`[ax_progress] Invalid percent: ${params.percent} (clamping to 0-100)`);
+        params.percent = Math.max(0, Math.min(100, params.percent));
       }
 
       // Send progress update
@@ -88,10 +98,11 @@ Best-effort: failures are silent and won't interrupt your work.`,
         });
 
         if (response.ok) {
-          logger.info(`[ax_progress] Sent: "${params.message}" (${params.percent ?? '?'}%)`);
+          logger.info(`[ax_progress] Sent: "${params.message}"${params.percent !== undefined ? ` (${params.percent}%)` : ''}`);
           return { ok: true, message: params.message };
         } else {
-          logger.warn(`[ax_progress] Failed: ${response.status}`);
+          const responseText = await response.text().catch(() => '');
+          logger.warn(`[ax_progress] Failed: ${response.status} - ${responseText}`);
           return { ok: false, error: `HTTP ${response.status}` };
         }
       } catch (err) {
