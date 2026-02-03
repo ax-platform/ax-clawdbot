@@ -7,11 +7,17 @@
  * 1. Auto-register/re-register webhook with aX backend
  * 2. Verify tool connectivity
  * 3. Post "System Ready" message
+ * 
+ * Configuration (via environment variables):
+ * - AX_BACKEND_URL: Backend API URL (default: https://api.paxai.app)
+ * - AX_MCP_URL: MCP endpoint URL (default: https://mcp.paxai.app)
  */
 
 import { getAgent } from "./auth.js";
 
+// Configurable URLs - users can override these for custom deployments
 const BACKEND_URL = process.env.AX_BACKEND_URL || "https://api.paxai.app";
+const MCP_URL = process.env.AX_MCP_URL || "https://mcp.paxai.app";
 
 // Track which agents have completed init (in-memory, resets on restart)
 const initializedAgents = new Set<string>();
@@ -123,7 +129,7 @@ async function verifyToolConnectivity(
   agentSecret: string,
   logger: { info: (msg: string) => void; error: (msg: string) => void }
 ): Promise<{ success: boolean; error?: string }> {
-  const mcpUrl = `https://mcp.paxai.app/mcp/agents/${agentId}`;
+  const mcpUrl = `${MCP_URL}/mcp/agents/${agentId}`;
 
   try {
     // Try to list available tools (simple connectivity check)
@@ -155,7 +161,7 @@ export async function sendSystemReadyMessage(
   spaceId: string,
   logger: { info: (msg: string) => void; error: (msg: string) => void }
 ): Promise<void> {
-  const mcpUrl = `https://mcp.paxai.app/mcp/agents/${agentId}`;
+  const mcpUrl = `${MCP_URL}/mcp/agents/${agentId}`;
 
   try {
     const response = await fetch(`${mcpUrl}/tools/messages`, {
