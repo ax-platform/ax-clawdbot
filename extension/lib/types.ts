@@ -30,6 +30,10 @@ export interface AxDispatchPayload {
     ax_mcp?: boolean;
     image_generation?: boolean;
   };
+  // Async dispatch callback URLs (new in Stage 2)
+  heartbeat_url?: string;
+  callback_url?: string;
+  callback_api_key?: string;
 }
 
 /**
@@ -73,10 +77,11 @@ export interface AgentEntry {
 
 // Dispatch response to backend
 export interface AxDispatchResponse {
-  status: "success" | "error";
+  status: "success" | "error" | "accepted";
   dispatch_id: string;
   response?: string;
   error?: string;
+  mode?: "sync" | "async";
 }
 
 // Session context stored per dispatch
