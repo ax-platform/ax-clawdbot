@@ -26,6 +26,7 @@ import type { AxDispatchPayload, AxDispatchResponse, DispatchSession } from "../
 import { loadAgentRegistry, getAgent, verifySignature, logRegisteredAgents } from "../lib/auth.js";
 import { sendProgressUpdate } from "../lib/api.js";
 import { buildMissionBriefing } from "../lib/context.js";
+import { needsInit, performInitHandshake, sendSystemReadyMessage } from "../lib/init.js";
 
 // Constants
 const DEDUP_TTL_MS = 15 * 60 * 1000; // 15 minutes (must exceed backend timeout of 10 min)
@@ -584,6 +585,18 @@ export function createDispatchHandler(
         api.logger.warn(`[ax-platform] Signature failed: ${verification.error}`);
         sendJson(res, 401, { status: "error", dispatch_id: "unknown", error: verification.error });
         return true;
+      }
+
+      // One-Click Onboarding: Auto-init on first dispatch
+      // This eliminates 405 errors by ensuring webhook is registered
+      if (needsInit(agentId)) {
+        const webhookUrl = `https://${req.headers.host}/ax/dispatch`;
+        api.logger.info(`[ax-platform] First dispatch for agent ${agentId.substring(0, 8)} - performing init handshake`);
+        const initResult = await performInitHandshake(agentId, agent.secret, webhookUrl, api.logger);
+        if (!initResult.success) {
+          api.logger.warn(`[ax-platform] Init handshake failed (non-fatal): ${initResult.error}`);
+          // Continue anyway - the dispatch might still work
+        }
       }
 
       // Parse payload
