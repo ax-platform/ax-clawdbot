@@ -27,6 +27,52 @@ import { loadAgentRegistry, getAgent, verifySignature, logRegisteredAgents } fro
 import { sendProgressUpdate } from "../lib/api.js";
 import { buildMissionBriefing } from "../lib/context.js";
 
+// ─── Agent Event Tracking ───────────────────────────────────────────────────
+// Subscribe to Clawdbot's global agent event bus for real-time tool tracking.
+// This replaces the generic "Processing..." heartbeat with rich progress info.
+//
+// The import is dynamic because `onAgentEvent` isn't exported via plugin-sdk;
+// we load it from Clawdbot's internals at runtime (same process, so it works).
+// If the import fails (e.g., path changes in a future version), we fall back
+// gracefully to the old behavior.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type AgentEvent = {
+  runId: string;
+  sessionKey?: string;
+  stream: string;
+  data: Record<string, unknown>;
+  seq: number;
+  ts: number;
+};
+type AgentEventListener = (event: AgentEvent) => void;
+type UnsubscribeFn = () => void;
+
+let _onAgentEvent: ((listener: AgentEventListener) => UnsubscribeFn) | null = null;
+let _agentEventsLoaded = false;
+
+/**
+ * Lazily load onAgentEvent from Clawdbot internals.
+ * Returns null if unavailable (graceful degradation).
+ */
+async function getOnAgentEvent(): Promise<typeof _onAgentEvent> {
+  if (_agentEventsLoaded) return _onAgentEvent;
+  _agentEventsLoaded = true;
+  try {
+    // Dynamic import using absolute path to bypass package.json exports restrictions
+    const mod = await import("/usr/local/lib/node_modules/clawdbot/dist/infra/agent-events.js");
+    if (typeof mod.onAgentEvent === "function") {
+      _onAgentEvent = mod.onAgentEvent;
+    }
+  } catch {
+    // Not available — fall back to generic heartbeats
+  }
+  return _onAgentEvent;
+}
+
+// Minimum interval between event-driven heartbeats (prevents flooding)
+const EVENT_HEARTBEAT_MIN_INTERVAL_MS = 3_000; // 3 seconds
+
 // Constants
 const DEDUP_TTL_MS = 15 * 60 * 1000; // 15 minutes (must exceed backend timeout of 10 min)
 const DEDUP_CLEANUP_INTERVAL_MS = 60 * 1000; // Clean up every minute
@@ -265,16 +311,84 @@ async function processDispatchAsync(
 
   api.logger.info(`[ax-platform] ASYNC: Starting background processing for ${dispatchId.substring(0, 8)}`);
 
-  // Heartbeat timer - initialized inside try block to ensure cleanup on any error
+  // ─── Rich Heartbeat State ──────────────────────────────────────────────
+  // Track agent tool execution via the global event bus so heartbeats
+  // report what the agent is actually doing instead of "Processing...".
+  // ───────────────────────────────────────────────────────────────────────
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let heartbeatCount = 0;
+  let unsubscribeEvents: UnsubscribeFn | null = null;
+
+  // Mutable state updated by event listener, read by heartbeat timer
+  let currentTool: string | null = null;
+  let toolCallCount = 0;
+  let lastEventHeartbeatTs = 0;
 
   try {
-    // Start heartbeat timer
+    // Try to subscribe to agent events for real-time tool tracking
+    const onAgentEvent = await getOnAgentEvent();
+    if (onAgentEvent) {
+      api.logger.info(`[ax-platform] ASYNC: Agent event tracking enabled for session ${sessionKey}`);
+      unsubscribeEvents = onAgentEvent((event: AgentEvent) => {
+        // Filter to events for THIS dispatch's session only
+        if (event.sessionKey !== sessionKey) return;
+
+        if (event.stream === "tool") {
+          const phase = typeof event.data.phase === "string" ? event.data.phase : "";
+          const toolName = typeof event.data.name === "string" ? event.data.name : "unknown";
+
+          if (phase === "start") {
+            currentTool = toolName;
+            toolCallCount++;
+            api.logger.info(`[ax-platform] ASYNC: Tool started: ${toolName} (#${toolCallCount})`);
+
+            // Send immediate heartbeat on tool start (rate-limited)
+            const now = Date.now();
+            if (now - lastEventHeartbeatTs >= EVENT_HEARTBEAT_MIN_INTERVAL_MS) {
+              lastEventHeartbeatTs = now;
+              if (payload.heartbeat_url && payload.callback_api_key) {
+                sendHeartbeat(
+                  payload.heartbeat_url,
+                  payload.callback_api_key,
+                  {
+                    agent_name: session.agentHandle,
+                    agent_id: session.agentId,
+                    org_id: session.spaceId,
+                    message_id: payload.message_id,
+                    progress: `Using ${toolName}...`,
+                    current_tool: toolName,
+                    elapsed_ms: now - startTime,
+                  },
+                  api.logger
+                ).catch(() => {}); // Fire-and-forget
+              }
+            }
+          } else if (phase === "end") {
+            currentTool = null;
+          }
+        }
+      });
+    } else {
+      api.logger.info(`[ax-platform] ASYNC: Agent event tracking unavailable — using generic heartbeats`);
+    }
+
+    // Start periodic heartbeat timer (enriched with tool info when available)
     heartbeatTimer = setInterval(async () => {
       heartbeatCount++;
       const elapsedMs = Date.now() - startTime;
-      api.logger.info(`[ax-platform] ASYNC: Sending heartbeat #${heartbeatCount} (${Math.round(elapsedMs / 1000)}s elapsed)`);
+      const elapsedSec = Math.round(elapsedMs / 1000);
+
+      // Build rich progress string
+      let progress: string;
+      if (currentTool) {
+        progress = `Using ${currentTool}... (${elapsedSec}s)`;
+      } else if (toolCallCount > 0) {
+        progress = `Thinking... (${toolCallCount} tool${toolCallCount > 1 ? 's' : ''} used, ${elapsedSec}s)`;
+      } else {
+        progress = `Processing... (${elapsedSec}s)`;
+      }
+
+      api.logger.info(`[ax-platform] ASYNC: Heartbeat #${heartbeatCount}: ${progress}`);
 
       if (payload.heartbeat_url && payload.callback_api_key) {
         await sendHeartbeat(
@@ -285,7 +399,8 @@ async function processDispatchAsync(
             agent_id: session.agentId,
             org_id: session.spaceId,
             message_id: payload.message_id,
-            progress: `Processing... (${Math.round(elapsedMs / 1000)}s)`,
+            progress,
+            current_tool: currentTool || undefined,
             elapsed_ms: elapsedMs,
           },
           api.logger
@@ -391,9 +506,9 @@ async function processDispatchAsync(
     // Mark dispatch as completed
     markDispatchCompleted(dispatchId, finalResponse);
 
-    // Send completion callback
+    // Send completion callback (with tool stats)
     if (payload.callback_url && payload.callback_api_key) {
-      api.logger.info(`[ax-platform] ASYNC: Sending completion callback`);
+      api.logger.info(`[ax-platform] ASYNC: Sending completion callback (${toolCallCount} tool calls)`);
       await sendCompletion(
         payload.callback_url,
         payload.callback_api_key,
@@ -405,6 +520,7 @@ async function processDispatchAsync(
           completion_status: completionStatus,
           response: finalResponse,
           error: lastError || undefined,
+          total_tool_calls: toolCallCount,
           elapsed_ms: elapsed,
         },
         api.logger
@@ -419,9 +535,13 @@ async function processDispatchAsync(
       sessionKeyIndex.delete(sessionKey);
     }, SESSION_CLEANUP_DELAY_MS);
   } finally {
-    // Always clean up heartbeat timer, even if errors occurred during context building
+    // Always clean up heartbeat timer and event subscription
     if (heartbeatTimer) {
       clearInterval(heartbeatTimer);
+    }
+    if (unsubscribeEvents) {
+      unsubscribeEvents();
+      api.logger.info(`[ax-platform] ASYNC: Unsubscribed from agent events (${toolCallCount} tool calls tracked)`);
     }
   }
 }
