@@ -595,11 +595,77 @@ export function createAxChannel(config: {
 
     capabilities: {
       chatTypes: ["direct", "group"],
+      media: { images: true, documents: true },
+      threads: true,
+      mentions: true,
     },
 
     config: {
-      listAccountIds: () => ["default"],
-      resolveAccount: () => ({ accountId: "default" }),
+      /**
+       * List all configured account IDs
+       * Reads from channels.ax-platform.accounts (preferred) or 
+       * falls back to plugins.entries.ax-platform.config.agents
+       */
+      listAccountIds: (cfg: any) => {
+        // Preferred: channels.ax-platform.accounts
+        const channelAccounts = cfg?.channels?.["ax-platform"]?.accounts;
+        if (channelAccounts && Object.keys(channelAccounts).length > 0) {
+          return Object.keys(channelAccounts);
+        }
+        
+        // Fallback: plugins.entries.ax-platform.config.agents (legacy)
+        const pluginAgents = cfg?.plugins?.entries?.["ax-platform"]?.config?.agents;
+        if (Array.isArray(pluginAgents) && pluginAgents.length > 0) {
+          return pluginAgents.map((a) => a.handle?.replace(/^@/, "") || a.id);
+        }
+        
+        return [];
+      },
+
+      /**
+       * Resolve account config by ID
+       * Returns account object with: accountId, agentId, secret, handle, enabled
+       */
+      resolveAccount: (cfg: any, accountId?: string) => {
+        // Preferred: channels.ax-platform.accounts
+        const channelAccounts = cfg?.channels?.["ax-platform"]?.accounts;
+        if (channelAccounts) {
+          const account = channelAccounts[accountId || "default"];
+          if (account) {
+            return {
+              accountId: accountId || "default",
+              agentId: account.agentId || account.id,
+              secret: account.secret,
+              handle: account.handle,
+              enabled: account.enabled !== false,
+              env: account.env,
+              ...account,
+            };
+          }
+        }
+        
+        // Fallback: plugins.entries.ax-platform.config.agents (legacy)
+        const pluginAgents = cfg?.plugins?.entries?.["ax-platform"]?.config?.agents;
+        if (Array.isArray(pluginAgents)) {
+          const agent = pluginAgents.find((a) => 
+            a.handle?.replace(/^@/, "") === accountId || 
+            a.id === accountId
+          ) || pluginAgents[0];
+          
+          if (agent) {
+            return {
+              accountId: agent.handle?.replace(/^@/, "") || agent.id,
+              agentId: agent.id,
+              secret: agent.secret,
+              handle: agent.handle,
+              enabled: true,
+              env: agent.env,
+            };
+          }
+        }
+        
+        return { accountId: accountId || "default" };
+      },
     },
 
     outbound: {
@@ -703,6 +769,45 @@ export function createAxChannel(config: {
         dispatchSessions.clear();
         sessionKeyIndex.clear();
         dispatchStates.clear();
+      },
+    },
+
+    // Status adapter for health checks
+    status: {
+      async getStatus(cfg: any) {
+        const accounts = [];
+        
+        // Check accounts from channels config
+        const channelAccounts = cfg?.channels?.["ax-platform"]?.accounts;
+        if (channelAccounts) {
+          for (const [id, account] of Object.entries(channelAccounts)) {
+            accounts.push({
+              id,
+              status: (account as any).enabled !== false ? "configured" : "disabled",
+              handle: (account as any).handle,
+            });
+          }
+        }
+        
+        // Fallback to plugin config
+        if (accounts.length === 0) {
+          const pluginAgents = cfg?.plugins?.entries?.["ax-platform"]?.config?.agents;
+          if (Array.isArray(pluginAgents)) {
+            for (const agent of pluginAgents) {
+              accounts.push({
+                id: agent.handle?.replace(/^@/, "") || agent.id,
+                status: "configured",
+                handle: agent.handle,
+              });
+            }
+          }
+        }
+        
+        return {
+          configured: accounts.length > 0,
+          accounts,
+          activeSessions: dispatchSessions.size,
+        };
       },
     },
   };
