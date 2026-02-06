@@ -22,7 +22,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { PluginRuntime } from "clawdbot/plugin-sdk";
-import type { AxDispatchPayload, AxDispatchResponse, DispatchSession } from "../lib/types.js";
+import type { AxDispatchPayload, AxDispatchResponse, DispatchSession, OutboundConfig } from "../lib/types.js";
 import { loadAgentRegistry, getAgent, verifySignature, logRegisteredAgents } from "../lib/auth.js";
 import { sendProgressUpdate } from "../lib/api.js";
 import { buildMissionBriefing } from "../lib/context.js";
@@ -572,10 +572,12 @@ export function getDispatchSession(sessionKey: string): DispatchSession | undefi
  * Create the aX Platform channel plugin
  */
 export function createAxChannel(config: {
+  outbound?: OutboundConfig;
   agents?: Array<{ id: string; secret: string; handle?: string; env?: string }>;
   backendUrl?: string;
 }) {
   const backendUrl = config.backendUrl || process.env.AX_BACKEND_URL || "http://localhost:8001";
+  const outboundConfig = config.outbound || {};
 
   // Load agent registry from config
   loadAgentRegistry(config.agents);
@@ -593,21 +595,163 @@ export function createAxChannel(config: {
 
     capabilities: {
       chatTypes: ["direct", "group"],
+      media: { images: true, documents: true },
+      threads: true,
+      mentions: true,
     },
 
     config: {
-      listAccountIds: () => ["default"],
-      resolveAccount: () => ({ accountId: "default" }),
+      /**
+       * List all configured account IDs
+       * Reads from channels.ax-platform.accounts (preferred) or 
+       * falls back to plugins.entries.ax-platform.config.agents
+       */
+      listAccountIds: (cfg: any) => {
+        // Preferred: channels.ax-platform.accounts
+        const channelAccounts = cfg?.channels?.["ax-platform"]?.accounts;
+        if (channelAccounts && Object.keys(channelAccounts).length > 0) {
+          return Object.keys(channelAccounts);
+        }
+        
+        // Fallback: plugins.entries.ax-platform.config.agents (legacy)
+        const pluginAgents = cfg?.plugins?.entries?.["ax-platform"]?.config?.agents;
+        if (Array.isArray(pluginAgents) && pluginAgents.length > 0) {
+          return pluginAgents.map((a) => a.handle?.replace(/^@/, "") || a.id);
+        }
+        
+        return [];
+      },
+
+      /**
+       * Resolve account config by ID
+       * Returns account object with: accountId, agentId, secret, handle, enabled
+       */
+      resolveAccount: (cfg: any, accountId?: string) => {
+        // Preferred: channels.ax-platform.accounts
+        const channelAccounts = cfg?.channels?.["ax-platform"]?.accounts;
+        if (channelAccounts) {
+          const account = channelAccounts[accountId || "default"];
+          if (account) {
+            return {
+              accountId: accountId || "default",
+              agentId: account.agentId || account.id,
+              secret: account.secret,
+              handle: account.handle,
+              enabled: account.enabled !== false,
+              env: account.env,
+              ...account,
+            };
+          }
+        }
+        
+        // Fallback: plugins.entries.ax-platform.config.agents (legacy)
+        const pluginAgents = cfg?.plugins?.entries?.["ax-platform"]?.config?.agents;
+        if (Array.isArray(pluginAgents)) {
+          const agent = pluginAgents.find((a) => 
+            a.handle?.replace(/^@/, "") === accountId || 
+            a.id === accountId
+          ) || pluginAgents[0];
+          
+          if (agent) {
+            return {
+              accountId: agent.handle?.replace(/^@/, "") || agent.id,
+              agentId: agent.id,
+              secret: agent.secret,
+              handle: agent.handle,
+              enabled: true,
+              env: agent.env,
+            };
+          }
+        }
+        
+        return { accountId: accountId || "default" };
+      },
     },
 
     outbound: {
-      deliveryMode: "direct",
+      deliveryMode: "direct" as const,
 
-      // Handle agent responses - this is called by the dispatcher
-      async sendText({ text, sessionKey }: { text: string; sessionKey?: string }) {
-        // For aX, responses are returned via HTTP response in the dispatch handler
-        // This is a no-op since we use sync-over-async pattern
-        return { ok: true };
+      /**
+       * Send text to aX Platform (for heartbeat/cron delivery)
+       * Uses MCP messages tool with configured token
+       */
+      async sendText({ 
+        text, 
+        to,
+        accountId,
+        sessionKey 
+      }: { 
+        text: string; 
+        to?: string; 
+        accountId?: string;
+        sessionKey?: string;
+      }) {
+        const logger = runtime?.logger || { info: console.log, error: console.error };
+        
+        // Get outbound config
+        const outboundCfg = outboundConfig || {};
+        const mcpEndpoint = outboundCfg.mcpEndpoint || process.env.AX_MCP_ENDPOINT || "https://mcp.paxai.app";
+        
+        let authToken: string | undefined;
+        
+        // Try token file first
+        if (outboundCfg.tokenFile) {
+          try {
+            const fs = await import("node:fs");
+            const tokenPath = outboundCfg.tokenFile.replace(/^~/, process.env.HOME || "");
+            const tokenData = JSON.parse(fs.readFileSync(tokenPath, "utf-8"));
+            authToken = tokenData.access_token;
+          } catch (err) {
+            logger.error(`[ax-platform] Failed to read token file: ${err}`);
+          }
+        }
+        
+        // Fallback to env var
+        if (!authToken) {
+          authToken = process.env.AX_ACCESS_TOKEN;
+        }
+        
+        if (!authToken) {
+          logger.error("[ax-platform] Outbound failed: No access token configured");
+          return { ok: false, error: "No access token" };
+        }
+        
+        // Determine target space (parse "space:UUID" or use directly)
+        const spaceId = to?.replace(/^space:/, "") || outboundCfg.defaultSpaceId;
+        if (!spaceId) {
+          logger.error("[ax-platform] Outbound failed: No target space");
+          return { ok: false, error: "No target space" };
+        }
+        
+        // Send via MCP messages tool
+        try {
+          const response = await fetch(`${mcpEndpoint}/tools/messages`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${authToken}`,
+            },
+            body: JSON.stringify({
+              action: "send",
+              content: text,
+              space_id: spaceId,
+            }),
+          });
+          
+          if (!response.ok) {
+            const errText = await response.text();
+            logger.error(`[ax-platform] Outbound failed: ${response.status} ${errText}`);
+            return { ok: false, error: `HTTP ${response.status}` };
+          }
+          
+          const result = await response.json();
+          const preview = text.length > 50 ? text.substring(0, 50) + "..." : text;
+          logger.info(`[ax-platform] Outbound sent to ${spaceId}: ${preview}`);
+          return { ok: true, messageId: result.message_id };
+        } catch (err) {
+          logger.error(`[ax-platform] Outbound error: ${err}`);
+          return { ok: false, error: String(err) };
+        }
       },
     },
 
@@ -627,6 +771,45 @@ export function createAxChannel(config: {
         dispatchStates.clear();
       },
     },
+
+    // Status adapter for health checks
+    status: {
+      async getStatus(cfg: any) {
+        const accounts = [];
+        
+        // Check accounts from channels config
+        const channelAccounts = cfg?.channels?.["ax-platform"]?.accounts;
+        if (channelAccounts) {
+          for (const [id, account] of Object.entries(channelAccounts)) {
+            accounts.push({
+              id,
+              status: (account as any).enabled !== false ? "configured" : "disabled",
+              handle: (account as any).handle,
+            });
+          }
+        }
+        
+        // Fallback to plugin config
+        if (accounts.length === 0) {
+          const pluginAgents = cfg?.plugins?.entries?.["ax-platform"]?.config?.agents;
+          if (Array.isArray(pluginAgents)) {
+            for (const agent of pluginAgents) {
+              accounts.push({
+                id: agent.handle?.replace(/^@/, "") || agent.id,
+                status: "configured",
+                handle: agent.handle,
+              });
+            }
+          }
+        }
+        
+        return {
+          configured: accounts.length > 0,
+          accounts,
+          activeSessions: dispatchSessions.size,
+        };
+      },
+    },
   };
 }
 
@@ -641,6 +824,7 @@ export function createDispatchHandler(
   config: { backendUrl?: string }
 ) {
   const backendUrl = config.backendUrl || "http://localhost:8001";
+  const outboundConfig = config.outbound || {};
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<boolean> => {
     // Only handle /ax/dispatch
