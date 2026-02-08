@@ -11,6 +11,7 @@
 
 import type { ClawdbotPluginApi, PluginRuntime } from "clawdbot/plugin-sdk";
 import { createAxChannel, createDispatchHandler, setAxPlatformRuntime, getDispatchSession } from "./channel/ax-channel.js";
+import type { OutboundConfig } from "./lib/types.js";
 import { logRegisteredAgents } from "./lib/auth.js";
 import { axMessagesTool } from "./tools/ax-messages.js";
 import { axTasksTool } from "./tools/ax-tasks.js";
@@ -18,6 +19,7 @@ import { axContextTool } from "./tools/ax-context.js";
 import { axAgentsTool } from "./tools/ax-agents.js";
 import { axThreadTool } from "./tools/ax-thread.js";
 import { createAxProgressTool } from "./tools/ax-progress.js";
+import { axDashboardTool } from "./tools/ax-dashboard.js";
 import { buildMissionBriefing } from "./lib/context.js";
 
 interface AxPlatformConfig {
@@ -28,6 +30,7 @@ interface AxPlatformConfig {
     env?: string;
   }>;
   backendUrl?: string;
+  outbound?: OutboundConfig;
 }
 
 const plugin = {
@@ -65,7 +68,7 @@ const plugin = {
     api.logger.info(`[ax-platform] Config received: agents=${config.agents?.length || 0}, backendUrl=${config.backendUrl || 'default'}`);
 
     // Register the aX Platform channel
-    const channel = createAxChannel(config);
+    const channel = createAxChannel({ ...config, outbound: config.outbound });
     api.registerChannel({ plugin: channel });
     api.logger.info("[ax-platform] Channel registered: ax-platform");
 
@@ -79,7 +82,8 @@ const plugin = {
     api.registerTool(axAgentsTool, { optional: true });
     api.registerTool(axThreadTool, { optional: true });
     api.registerTool(createAxProgressTool(api.runtime), { optional: true });
-    api.logger.info("[ax-platform] Tools registered: ax_messages, ax_tasks, ax_context, ax_agents, ax_thread, ax_progress");
+    api.registerTool(axDashboardTool, { optional: true });
+    api.logger.info("[ax-platform] Tools registered: ax_messages, ax_tasks, ax_context, ax_agents, ax_thread, ax_progress, ax_dashboard");
 
     // Register before_agent_start hook for context injection
     // Uses api.on() event pattern (like memory-lancedb plugin)
