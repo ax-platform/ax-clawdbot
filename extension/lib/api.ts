@@ -39,6 +39,9 @@ export async function sendProgressUpdate(
  *
  * The MCP server speaks JSON-RPC at {mcpEndpoint}/mcp.
  * We send a `tools/call` request with the tool name and arguments.
+ *
+ * Previous implementation used REST: `${mcpEndpoint}/tools/${toolName}`
+ * which doesn't exist on the MCP server. Fixed to use proper MCP JSON-RPC.
  */
 export async function callAxTool(
   mcpEndpoint: string,
@@ -85,6 +88,7 @@ export async function callAxTool(
   // Handle SSE (streaming) responses — collect until we get a JSON-RPC result
   if (contentType.includes("text/event-stream")) {
     const text = await response.text();
+    // Parse SSE events — find the last `data:` line with a JSON-RPC result
     const lines = text.split("\n");
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i].trim();
@@ -99,7 +103,10 @@ export async function callAxTool(
           }
         } catch (parseErr) {
           if (parseErr instanceof Error && parseErr.message.startsWith("MCP error:")) throw parseErr;
-          // Not valid JSON — skip
+          // Not valid JSON — log for debugging and skip
+          if (process.env.DEBUG || process.env.LOG_LEVEL === "debug") {
+            console.debug(`[ax-platform] SSE parse skip: ${line.substring(0, 100)}`);
+          }
         }
       }
     }
@@ -115,10 +122,17 @@ export async function callAxTool(
 }
 
 /**
- * Extract text content from an MCP tools/call result.
+ * Extract the text content from an MCP tools/call result.
  *
- * MCP returns: { content: [{ type: "text", text: "..." }, ...] }
- * This extracts text parts, tries JSON parse, falls back to raw string.
+ * MCP returns results in the format:
+ *   { content: [{ type: "text", text: "..." }, ...] }
+ *
+ * This function:
+ * 1. Extracts all text content parts from the content array
+ * 2. Joins them with newlines
+ * 3. Attempts to parse as JSON (for structured results like message lists)
+ * 4. Falls back to raw text string if not valid JSON
+ * 5. Returns the original result if no content array is present
  */
 function extractToolResult(result: unknown): unknown {
   if (!result || typeof result !== "object") return result;

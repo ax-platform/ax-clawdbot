@@ -26,7 +26,6 @@ import type { AxDispatchPayload, AxDispatchResponse, DispatchSession, OutboundCo
 import { loadAgentRegistry, getAgent, verifySignature, logRegisteredAgents } from "../lib/auth.js";
 import { sendProgressUpdate, callAxTool } from "../lib/api.js";
 import { buildMissionBriefing } from "../lib/context.js";
-import { needsInit, performInitHandshake, sendSystemReadyMessage } from "../lib/init.js";
 
 // ─── Agent Event Tracking ───────────────────────────────────────────────────
 // Subscribe to Clawdbot's global agent event bus for real-time tool tracking.
@@ -570,30 +569,41 @@ export function getDispatchSession(sessionKey: string): DispatchSession | undefi
 }
 
 /**
- * Resolve auth token for outbound delivery.
- * Tries tokenFile first, then AX_ACCESS_TOKEN env var.
+ * Create the aX Platform channel plugin
  */
-async function resolveOutboundToken(outboundCfg: OutboundConfig | Record<string, unknown>): Promise<string | undefined> {
-  const cfg = outboundCfg || {};
-  const tokenFile = (cfg as OutboundConfig).tokenFile;
 
-  if (tokenFile) {
+/**
+ * Resolve auth token for outbound MCP calls.
+ * Checks token file first, then env var.
+ */
+async function resolveOutboundAuthToken(
+  outboundCfg: OutboundConfig,
+  logger: { error: (msg: string) => void }
+): Promise<string> {
+  let authToken: string | undefined;
+
+  if (outboundCfg.tokenFile) {
     try {
       const fs = await import("node:fs");
-      const tokenPath = tokenFile.replace(/^~/, process.env.HOME || "");
+      const tokenPath = outboundCfg.tokenFile.replace(/^~/, process.env.HOME || "");
       const tokenData = JSON.parse(fs.readFileSync(tokenPath, "utf-8"));
-      if (tokenData.access_token) return tokenData.access_token;
-    } catch {
-      // Fall through to env var
+      authToken = tokenData.access_token;
+    } catch (err) {
+      logger.error(`[ax-platform] Failed to read token file: ${err}`);
     }
   }
 
-  return process.env.AX_ACCESS_TOKEN;
+  if (!authToken) {
+    authToken = process.env.AX_ACCESS_TOKEN;
+  }
+
+  if (!authToken) {
+    throw new Error("[ax-platform] Outbound failed: No access token configured. Set outbound.tokenFile or AX_ACCESS_TOKEN.");
+  }
+
+  return authToken;
 }
 
-/**
- * Create the aX Platform channel plugin
- */
 export function createAxChannel(config: {
   outbound?: OutboundConfig;
   agents?: Array<{ id: string; secret: string; handle?: string; env?: string }>;
@@ -604,18 +614,6 @@ export function createAxChannel(config: {
 
   // Load agent registry from config
   loadAgentRegistry(config.agents);
-
-  // Probe cache — one MCP call covers all prod accounts
-  let probeCache: { result: any; ts: number } | null = null;
-
-  // Helper: get agents array from clawdbot config
-  function getPluginAgents(cfg: any): Array<{ id: string; secret: string; handle?: string; env?: string }> {
-    const pluginAgents = cfg?.plugins?.entries?.["ax-platform"]?.config?.agents;
-    if (Array.isArray(pluginAgents) && pluginAgents.length > 0) {
-      return pluginAgents;
-    }
-    return config.agents || [];
-  }
 
   return {
     id: "ax-platform",
@@ -630,184 +628,115 @@ export function createAxChannel(config: {
 
     capabilities: {
       chatTypes: ["direct", "group"],
-      media: { images: true, documents: true },
-      threads: true,
-      mentions: true,
     },
 
     config: {
-      /**
-       * List all configured account IDs
-       */
-      listAccountIds: (cfg: any) => {
-        return getPluginAgents(cfg).map((a) => a.handle?.replace(/^@/, "") || a.id);
-      },
-
-      /**
-       * Default account ID - first prod agent, or first agent
-       */
-      defaultAccountId: (cfg: any) => {
-        const agents = getPluginAgents(cfg);
-        const prod = agents.find((a) => a.env === "prod");
-        const agent = prod || agents[0];
-        return agent ? (agent.handle?.replace(/^@/, "") || agent.id) : "default";
-      },
-
-      /**
-       * Check if account is enabled
-       */
-      isEnabled: (account: any) => account?.enabled !== false,
-
-      /**
-       * Check if account has required credentials
-       */
-      isConfigured: (account: any) => Boolean(account?.agentId && account?.secret),
-
-      /**
-       * Describe account for dashboard listing
-       */
-      describeAccount: (account: any) => ({
-        accountId: account?.accountId || "default",
-        name: account?.handle ? `@${account.handle.replace(/^@/, "")}` : account?.accountId,
-        enabled: account?.enabled !== false,
-        configured: Boolean(account?.agentId && account?.secret),
-      }),
-
-      /**
-       * Resolve account config by ID
-       */
-      resolveAccount: (cfg: any, accountId?: string) => {
-        const agents = getPluginAgents(cfg);
-        const agent = agents.find((a) =>
-          a.handle?.replace(/^@/, "") === accountId ||
-          a.id === accountId
-        ) || (accountId ? undefined : agents[0]);
-
-        if (agent) {
-          return {
-            accountId: agent.handle?.replace(/^@/, "") || agent.id,
-            agentId: agent.id,
-            secret: agent.secret,
-            handle: agent.handle,
-            enabled: true,
-            env: agent.env,
-          };
-        }
-
-        return { accountId: accountId || "default" };
-      },
+      listAccountIds: () => ["default"],
+      resolveAccount: () => ({ accountId: "default" }),
     },
 
     outbound: {
       deliveryMode: "direct" as const,
-      chunker: null,
-      textChunkLimit: 4000,
 
       /**
-       * Send text to aX Platform (for heartbeat/cron delivery)
-       * Matches Clawdbot's standard channel outbound interface
+       * Resolve outbound target for aX Platform
+       * Accepts "space:<id>" or raw space ID
        */
-      async sendText({
-        to,
-        text,
-        accountId,
-        cfg,
-        replyToId,
-        threadId,
-        deps,
-      }: {
+      resolveTarget({ to }: { to?: string; accountId?: string | null }) {
+        const spaceId = to?.replace(/^space:/, "") || outboundConfig?.defaultSpaceId;
+        if (!spaceId) {
+          return { ok: false as const, error: new Error("No target space. Use 'space:<id>' or configure defaultSpaceId.") };
+        }
+        return { ok: true as const, to: spaceId };
+      },
+
+      /**
+       * Send text to aX Platform via MCP JSON-RPC protocol.
+       *
+       * Matches Clawdbot ChannelOutboundContext signature:
+       *   (ctx: { cfg, to, text, accountId?, ... }) => Promise<OutboundDeliveryResult>
+       *
+       * Uses callAxTool which sends proper MCP tools/call JSON-RPC to the server.
+       */
+      async sendText({ text, to }: {
+        cfg: unknown;
         to: string;
         text: string;
-        accountId?: string;
-        cfg?: any;
-        replyToId?: string;
-        threadId?: string;
-        deps?: any;
+        mediaUrl?: string;
+        accountId?: string | null;
+        replyToId?: string | null;
+        threadId?: string | number | null;
+        deps?: unknown;
+        gifPlayback?: boolean;
       }) {
         const logger = runtime?.logger || { info: console.log, error: console.error };
-
-        const authToken = await resolveOutboundToken(outboundConfig);
-        if (!authToken) {
-          logger.error("[ax-platform] Outbound sendText failed: No access token configured");
-          return { channel: "ax-platform", ok: false, error: "No access token" };
-        }
-
         const outboundCfg = outboundConfig || {};
         const mcpEndpoint = outboundCfg.mcpEndpoint || process.env.AX_MCP_ENDPOINT || "https://mcp.paxai.app";
-        const spaceId = to?.replace(/^space:/, "") || outboundCfg.defaultSpaceId;
-        if (!spaceId) {
-          logger.error("[ax-platform] Outbound sendText failed: No target space");
-          return { channel: "ax-platform", ok: false, error: "No target space" };
-        }
+        const authToken = await resolveOutboundAuthToken(outboundCfg, logger);
 
+        // Send via MCP JSON-RPC (callAxTool now uses proper protocol)
         try {
           const result = await callAxTool(mcpEndpoint, authToken, "messages", {
             action: "send",
             content: text,
-            space_id: spaceId,
-          }) as Record<string, unknown>;
+            space_id: to,
+          });
+
+          const messageId = (result && typeof result === "object" && "message_id" in result)
+            ? String((result as Record<string, unknown>).message_id)
+            : `ax-${Date.now()}`;
 
           const preview = text.length > 50 ? text.substring(0, 50) + "..." : text;
-          logger.info(`[ax-platform] Outbound sent to ${spaceId}: ${preview}`);
-          return { channel: "ax-platform", ok: true, messageId: result.message_id };
+          logger.info(`[ax-platform] Outbound sent to ${to}: ${preview}`);
+
+          return {
+            channel: "ax-platform" as const,
+            messageId,
+            chatId: to,
+          };
         } catch (err) {
-          logger.error(`[ax-platform] Outbound sendText error: ${err}`);
-          return { channel: "ax-platform", ok: false, error: String(err) };
+          logger.error(`[ax-platform] Outbound error: ${err}`);
+          throw err;
         }
       },
 
       /**
-       * Send media to aX Platform (for heartbeat/cron delivery)
-       * Matches Clawdbot's standard channel outbound interface
+       * Send media to aX Platform (sends caption + media link)
        */
-      async sendMedia({
-        to,
-        text,
-        mediaUrl,
-        accountId,
-        cfg,
-        replyToId,
-        threadId,
-        deps,
-      }: {
+      async sendMedia({ text, to, mediaUrl }: {
+        cfg: unknown;
         to: string;
-        text?: string;
-        mediaUrl: string;
-        accountId?: string;
-        cfg?: any;
-        replyToId?: string;
-        threadId?: string;
-        deps?: any;
+        text: string;
+        mediaUrl?: string;
+        accountId?: string | null;
+        replyToId?: string | null;
+        threadId?: string | number | null;
+        deps?: unknown;
+        gifPlayback?: boolean;
       }) {
         const logger = runtime?.logger || { info: console.log, error: console.error };
-
-        const authToken = await resolveOutboundToken(outboundConfig);
-        if (!authToken) {
-          logger.error("[ax-platform] Outbound sendMedia failed: No access token configured");
-          return { channel: "ax-platform", ok: false, error: "No access token" };
-        }
-
         const outboundCfg = outboundConfig || {};
         const mcpEndpoint = outboundCfg.mcpEndpoint || process.env.AX_MCP_ENDPOINT || "https://mcp.paxai.app";
-        const spaceId = to?.replace(/^space:/, "") || outboundCfg.defaultSpaceId;
-        if (!spaceId) {
-          logger.error("[ax-platform] Outbound sendMedia failed: No target space");
-          return { channel: "ax-platform", ok: false, error: "No target space" };
-        }
+        const authToken = await resolveOutboundAuthToken(outboundCfg, logger);
 
+        const content = mediaUrl ? `${text}\n${mediaUrl}` : text;
         try {
-          const content = text ? `${text}\n\n${mediaUrl}` : mediaUrl;
           const result = await callAxTool(mcpEndpoint, authToken, "messages", {
             action: "send",
             content,
-            space_id: spaceId,
-          }) as Record<string, unknown>;
-
-          logger.info(`[ax-platform] Outbound media sent to ${spaceId}: ${mediaUrl}`);
-          return { channel: "ax-platform", ok: true, messageId: result.message_id };
+            space_id: to,
+          });
+          const messageId = (result && typeof result === "object" && "message_id" in result)
+            ? String((result as Record<string, unknown>).message_id)
+            : `ax-${Date.now()}`;
+          return {
+            channel: "ax-platform" as const,
+            messageId,
+            chatId: to,
+          };
         } catch (err) {
-          logger.error(`[ax-platform] Outbound sendMedia error: ${err}`);
-          return { channel: "ax-platform", ok: false, error: String(err) };
+          logger.error(`[ax-platform] Outbound media error: ${err}`);
+          throw err;
         }
       },
     },
@@ -828,82 +757,6 @@ export function createAxChannel(config: {
         dispatchStates.clear();
       },
     },
-
-    // Status adapter for dashboard health checks
-    status: {
-      defaultRuntime: {
-        accountId: "default",
-        running: false,
-        lastStartAt: null,
-        lastStopAt: null,
-        lastError: null,
-      },
-
-      buildAccountSnapshot: ({ account, runtime, probe, audit }: {
-        account: any; cfg?: any; runtime?: any; probe?: any; audit?: any;
-      }) => ({
-        accountId: account?.accountId || "default",
-        name: account?.handle ? `@${account.handle.replace(/^@/, "")}` : account?.accountId,
-        enabled: account?.enabled !== false,
-        configured: Boolean(account?.agentId && account?.secret),
-        running: runtime?.running ?? false,
-        connected: probe?.ok ?? undefined,
-        lastStartAt: runtime?.lastStartAt ?? null,
-        lastStopAt: runtime?.lastStopAt ?? null,
-        lastError: runtime?.lastError ?? null,
-        lastInboundAt: runtime?.lastInboundAt ?? null,
-        lastOutboundAt: runtime?.lastOutboundAt ?? null,
-        mode: "webhook",
-        probe,
-        audit,
-      }),
-
-      buildChannelSummary: ({ snapshot }: { snapshot: any; account?: any; cfg?: any; defaultAccountId?: string }) => ({
-        configured: snapshot?.configured ?? false,
-        running: snapshot?.running ?? false,
-        lastError: snapshot?.lastError ?? null,
-      }),
-
-      probeAccount: async ({ account, timeoutMs }: { account: any; timeoutMs: number; cfg?: any }) => {
-        if (!account?.agentId || !account?.secret) {
-          return { ok: false, error: "Missing agentId or secret" };
-        }
-
-        // Only probe prod agents against paxai.app
-        if (account.env && account.env !== "prod") {
-          return { ok: true, mode: "local", skipped: true };
-        }
-
-        const token = await resolveOutboundToken(outboundConfig);
-        if (!token) {
-          return { ok: false, error: "No access token for outbound" };
-        }
-
-        // Reuse cached probe if fresh (within 60s) — avoids N calls per status refresh
-        if (probeCache && Date.now() - probeCache.ts < 60000) {
-          return probeCache.result;
-        }
-
-        const mcpEndpoint = (outboundConfig as OutboundConfig).mcpEndpoint
-          || process.env.AX_MCP_ENDPOINT || "https://mcp.paxai.app";
-        const handle = account.handle?.replace(/^@/, "") || account.accountId;
-
-        try {
-          const data = await callAxTool(mcpEndpoint, token, "agents", {
-            search: handle,
-            limit: 1,
-          }) as any;
-          const found = Array.isArray(data?.agents) && data.agents.length > 0;
-          const result = { ok: true, mode: "webhook", agentFound: found, handle: `@${handle}` };
-          probeCache = { result, ts: Date.now() };
-          return result;
-        } catch (err: any) {
-          const result = { ok: false, error: String(err) };
-          probeCache = { result, ts: Date.now() };
-          return result;
-        }
-      },
-    },
   };
 }
 
@@ -918,7 +771,6 @@ export function createDispatchHandler(
   config: { backendUrl?: string }
 ) {
   const backendUrl = config.backendUrl || "http://localhost:8001";
-  const outboundConfig = config.outbound || {};
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<boolean> => {
     // Only handle /ax/dispatch
@@ -980,18 +832,6 @@ export function createDispatchHandler(
         api.logger.warn(`[ax-platform] Signature failed: ${verification.error}`);
         sendJson(res, 401, { status: "error", dispatch_id: "unknown", error: verification.error });
         return true;
-      }
-
-      // One-Click Onboarding: Auto-init on first dispatch
-      // This eliminates 405 errors by ensuring webhook is registered
-      if (needsInit(agentId)) {
-        const webhookUrl = `https://${req.headers.host}/ax/dispatch`;
-        api.logger.info(`[ax-platform] First dispatch for agent ${agentId.substring(0, 8)} - performing init handshake`);
-        const initResult = await performInitHandshake(agentId, agent.secret, webhookUrl, api.logger);
-        if (!initResult.success) {
-          api.logger.warn(`[ax-platform] Init handshake failed (non-fatal): ${initResult.error}`);
-          // Continue anyway - the dispatch might still work
-        }
       }
 
       // Parse payload
