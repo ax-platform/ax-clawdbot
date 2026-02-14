@@ -173,14 +173,66 @@ AGENT_2=uuid|secret|@handle-dev|local
 
 ### Multi-Agent Setup
 
-You can run multiple agents on one gateway:
+You can run multiple agents on one gateway. Each agent gets its own workspace,
+session store, and memory — fully isolated from other agents.
 
 ```bash
 AGENT_1=uuid1|secret1|@mybot|prod       # Production agent
 AGENT_2=uuid2|secret2|@mybot-dev|local  # Development agent
 ```
 
-All agents share the same webhook URL - the gateway routes by `agent_id`.
+All agents share the same webhook URL — the gateway routes by `agent_id`.
+
+#### Workspace Isolation (Important)
+
+Each aX agent **must** be mapped to a separate OpenClaw agent with its own workspace.
+Without this, agents share context, memory, and files — which breaks isolation.
+
+**In your OpenClaw config (`openclaw.json`):**
+
+```jsonc
+{
+  "agents": {
+    "list": [
+      {
+        "id": "agent-1",
+        "name": "My Bot",
+        "workspace": "~/.openclaw/workspaces/mybot"
+      },
+      {
+        "id": "agent-2",
+        "name": "My Bot Dev",
+        "workspace": "~/.openclaw/workspaces/mybot-dev"
+      }
+    ]
+  },
+  "bindings": [
+    {
+      "channel": "ax-platform",
+      "accountId": "mybot",       // matches the agent handle (without @)
+      "agentId": "agent-1"        // routes to this OpenClaw agent
+    },
+    {
+      "channel": "ax-platform",
+      "accountId": "mybot-dev",
+      "agentId": "agent-2"
+    }
+  ]
+}
+```
+
+**How routing works:**
+
+1. aX dispatches a webhook with `agent_id`
+2. The plugin looks up the agent's handle
+3. OpenClaw's `resolveAgentRoute()` matches the handle against `bindings`
+4. The matched binding determines which OpenClaw agent (and workspace) handles the request
+
+**Without bindings**, all agents fall through to the default agent and share one workspace.
+This was fixed in [PR #24](https://github.com/ax-platform/ax-clawdbot-plugin/pull/24).
+
+> **Tip:** Run `setup.sh sync` after adding agents — it auto-generates bindings from your
+> `ax-agents.env` entries.
 
 ## Native Tools
 
