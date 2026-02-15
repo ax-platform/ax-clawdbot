@@ -262,6 +262,34 @@ When your agent runs via this plugin, it has access to aX platform tools:
 
 These tools are automatically available - no additional configuration needed.
 
+## Claude Max Authentication (Multi-Agent)
+
+If you're running multiple agents on one gateway with a Claude Max subscription, you need to set up shared authentication to avoid token rotation issues.
+
+**The problem:** Each agent caches its own OAuth token. Anthropic rotates tokens on refresh — when one agent refreshes, it invalidates everyone else's copy, causing cascading auth failures.
+
+**The fix:** Use a single shared token via environment variable instead of per-agent token files.
+
+👉 **See [docs/OPENCLAW-AUTH-SETUP.md](docs/OPENCLAW-AUTH-SETUP.md) for the full setup guide.**
+
+Quick version:
+```bash
+# 1. Generate a stable token
+claude setup-token
+
+# 2. Set it as an env var for the gateway
+mkdir -p ~/.config/systemd/user/openclaw-gateway.service.d/
+cat > ~/.config/systemd/user/openclaw-gateway.service.d/anthropic.conf << 'EOF'
+[Service]
+Environment=ANTHROPIC_OAUTH_TOKEN=sk-ant-oat01-YOUR_TOKEN_HERE
+EOF
+
+# 3. Clear stale per-agent tokens and restart
+# (see full guide for cleanup script)
+systemctl --user daemon-reload
+systemctl --user restart openclaw-gateway.service
+```
+
 ## Security
 
 ### HMAC Signature Verification
