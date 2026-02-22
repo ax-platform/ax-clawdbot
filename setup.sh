@@ -15,6 +15,10 @@
 #   ./setup.sh help         - Show help
 #
 # Secrets source: ax-agents.env (format: AGENT_N=id|secret|handle|env)
+#
+# SAFETY: sync only updates plugin agent credentials and ensures agent/binding
+# entries exist. It never overwrites backendUrl, outbound config, workspace paths,
+# heartbeat config, model settings, or other user-managed config.
 
 set -e
 
@@ -56,33 +60,27 @@ usage() {
     echo "Usage: ./setup.sh <command> [args]"
     echo ""
     echo "Commands:"
-    echo "  sync              Sync ax-agents.env to clawdbot.json and restart"
-    echo "  clean             Clean install - remove old config, reinstall plugin"
+    echo "  sync              Sync ax-agents.env credentials to config and restart"
+    echo "  clean             Clean install - remove old extension, reinstall, sync"
     echo "  secret ID SECRET  Update secret for agent ID"
     echo "  add ID SECRET HANDLE ENV  Add new agent to ax-agents.env"
     echo "  remove ID         Remove agent from ax-agents.env"
     echo "  list              List all configured agents"
-    echo "  restart           Restart gateway (quick)"
-    echo "  reload            Reload gateway (full plist reload)"
+    echo "  restart           Restart gateway"
     echo "  logs              Tail gateway logs (Ctrl+C to exit)"
     echo "  status            Check gateway and tunnel status"
     echo "  help              Show this help"
     echo ""
-    echo "Examples:"
-    echo "  ./setup.sh sync"
-    echo "  ./setup.sh secret e5c6041a-824c-4216-8520-1d928fe6f789 newSecretHere"
-    echo "  ./setup.sh add uuid-here secret-here @myagent prod"
-    echo ""
     echo "Config file: ax-agents.env"
     echo "Format: AGENT_N=id|secret|handle|env"
     echo ""
-    echo "Note: Sync automatically cleans stale AX_* env vars from the LaunchAgent plist"
-    echo "      to prevent signature verification failures."
+    echo "Note: sync only updates agent credentials. It preserves all other config"
+    echo "      (backendUrl, outbound, workspace paths, heartbeat, models, etc)."
 }
 
 check_deps() {
     if ! command -v jq &> /dev/null; then
-        log_error "jq is required. Install with: brew install jq"
+        log_error "jq is required. Install with: brew install jq (macOS) or apt install jq (Linux)"
         exit 1
     fi
 }
@@ -106,6 +104,18 @@ check_config() {
         log_error "$CONFIG_FILE not found. Is OpenClaw/Clawdbot installed?"
         exit 1
     fi
+}
+
+# Create timestamped backup of config before any modifications
+backup_config() {
+    local backup_dir="$CONFIG_DIR/backups"
+    mkdir -p "$backup_dir"
+    local timestamp=$(date -u +%Y%m%dT%H%M%SZ)
+    local backup_file="$backup_dir/config-backup-${timestamp}.json"
+    cp "$CONFIG_FILE" "$backup_file"
+    log_info "Config backed up to $backup_file"
+    # Keep only last 10 backups
+    ls -t "$backup_dir"/config-backup-*.json 2>/dev/null | tail -n +11 | xargs rm -f 2>/dev/null || true
 }
 
 # Parse agents from env file into JSON
@@ -133,7 +143,45 @@ parse_agents() {
     echo "$agents_json"
 }
 
-# Sync env file to clawdbot.json and restart
+# Copy extension files from source to install directory (non-destructive)
+# Copies over existing files without deleting the directory first
+update_extension() {
+    local source_dir="$SCRIPT_DIR/extension"
+    if [[ ! -d "$source_dir" ]]; then
+        log_error "Extension source not found at $source_dir"
+        return 1
+    fi
+
+    mkdir -p "$EXTENSION_DIR"
+    # rsync if available (preserves structure, handles deletions cleanly)
+    if command -v rsync &> /dev/null; then
+        rsync -a --delete "$source_dir/" "$EXTENSION_DIR/"
+    else
+        # Fallback: copy over
+        cp -r "$source_dir/"* "$EXTENSION_DIR/"
+    fi
+
+    # Ensure installs manifest exists in config
+    local has_install=$(jq -r '.plugins.installs["ax-platform"] // empty' "$CONFIG_FILE")
+    if [[ -z "$has_install" ]]; then
+        local updated
+        updated=$(jq --arg src "$source_dir" --arg dst "$EXTENSION_DIR" '
+            .plugins.installs["ax-platform"] = {
+                source: "path",
+                sourcePath: $src,
+                installPath: $dst,
+                version: "0.2.0",
+                installedAt: (now | strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+            }
+        ' "$CONFIG_FILE")
+        echo "$updated" > "$CONFIG_FILE"
+    fi
+
+    log_ok "Extension updated at $EXTENSION_DIR"
+}
+
+# Sync env file to config and restart
+# SAFETY: Only updates plugin agent credentials. Preserves all other config.
 cmd_sync() {
     check_deps
     check_env_file
@@ -144,6 +192,9 @@ cmd_sync() {
     echo -e "${CYAN}  ax-clawdbot Sync${NC}"
     echo -e "${CYAN}===========================================${NC}"
     echo ""
+
+    # Back up config before any changes
+    backup_config
 
     log_info "Reading agents from ax-agents.env..."
     AGENTS_JSON=$(parse_agents)
@@ -159,100 +210,86 @@ cmd_sync() {
 
     log_ok "Found $AGENT_COUNT agent(s)"
 
-    # Clean reinstall: remove old extension and clear config entries first
-    log_info "Reinstalling extension..."
-    rm -rf "$EXTENSION_DIR" 2>/dev/null || true
-    # Clear config entries to avoid validation error during install
-    TEMP_CONFIG=$(cat "$CONFIG_FILE" | jq 'del(.plugins.entries["ax-platform"]) | del(.plugins.installs["ax-platform"])')
-    echo "$TEMP_CONFIG" > "$CONFIG_FILE"
-    cd "$SCRIPT_DIR/extension"
-    if $CLI_CMD plugins install . 2>&1 | grep -v "^\\[" | head -5; then
-        log_ok "Extension installed"
-    else
-        log_warn "Extension install had warnings (check logs)"
-    fi
-    cd "$SCRIPT_DIR"
+    # Update extension files (non-destructive copy)
+    log_info "Updating extension files..."
+    update_extension
 
-    log_info "Updating clawdbot.json..."
-    # Resolve outbound token file (first .ax-token.json found in workspaces)
-    local token_file=""
-    for ws in "$CONFIG_DIR/workspaces"/*/.ax-token.json; do
-        if [[ -f "$ws" ]]; then
-            token_file="$ws"
-            break
-        fi
-    done
-
-    UPDATED_CONFIG=$(cat "$CONFIG_FILE" | jq --argjson agents "$AGENTS_JSON" --arg tokenFile "${token_file}" '
+    # Update ONLY the agent credentials in plugin config
+    # Preserves: backendUrl, outbound config, and everything else
+    log_info "Updating agent credentials..."
+    UPDATED_CONFIG=$(jq --argjson agents "$AGENTS_JSON" '
         .plugins.entries["ax-platform"].enabled = true |
-        .plugins.entries["ax-platform"].config.agents = $agents |
-        .plugins.entries["ax-platform"].config.backendUrl = "https://api.paxai.app" |
-        .plugins.entries["ax-platform"].config.outbound.mcpEndpoint = "https://mcp.paxai.app" |
-        if $tokenFile != "" then .plugins.entries["ax-platform"].config.outbound.tokenFile = $tokenFile else . end
-    ')
+        .plugins.entries["ax-platform"].config.agents = $agents
+    ' "$CONFIG_FILE")
     echo "$UPDATED_CONFIG" > "$CONFIG_FILE"
-    if [[ -n "$token_file" ]]; then
-        log_ok "Updated plugin config (outbound token: ${token_file##*/workspaces/})"
-    else
-        log_warn "Updated plugin config (no .ax-token.json found for outbound)"
-    fi
+    log_ok "Updated agent credentials (other plugin config preserved)"
 
-    # Provision agent directories and config entries
-    # Each agent needs its own agentDir (sessions/models) and workspace to avoid
-    # routing to "main" and DuplicateAgentDirError when multiple agents share a dir
-    if [[ "$AGENT_COUNT" -gt 0 ]]; then
-        log_info "Provisioning agent directories..."
-        local agents_dir="$CONFIG_DIR/agents"
-        local workspaces_dir="$CONFIG_DIR/workspaces"
-        local main_models="$agents_dir/main/agent/models.json"
+    # Ensure each agent has an entry in agents.list (merge, don't replace)
+    # Only adds missing entries — never overwrites existing workspace, model,
+    # heartbeat, or other per-agent config
+    log_info "Ensuring agent entries exist..."
+    local agents_added=0
+    for handle_raw in $(echo "$AGENTS_JSON" | jq -r '.[].handle // "@agent"'); do
+        local agent_name="${handle_raw#@}"
+        local has_entry
+        has_entry=$(jq --arg id "$agent_name" '.agents.list // [] | map(select(.id == $id)) | length' "$CONFIG_FILE")
 
-        local agents_list_json="[]"
-        for handle_raw in $(echo "$AGENTS_JSON" | jq -r '.[].handle // "@agent"'); do
-            local agent_name="${handle_raw#@}"
+        if [[ "$has_entry" -eq 0 ]]; then
+            local agents_dir="$CONFIG_DIR/agents"
             local agent_dir="$agents_dir/$agent_name/agent"
-            local workspace_dir="$workspaces_dir/$agent_name"
-
+            local workspace_dir="$CONFIG_DIR/workspaces/$agent_name"
             mkdir -p "$agent_dir" "$workspace_dir"
 
-            # Copy models.json from main agent if available and not already present
+            # Copy models.json from main agent if available
+            local main_models="$agents_dir/main/agent/models.json"
             if [[ -f "$main_models" && ! -f "$agent_dir/models.json" ]]; then
                 cp "$main_models" "$agent_dir/models.json"
             fi
 
-            agents_list_json=$(echo "$agents_list_json" | jq \
-                --arg id "$agent_name" \
-                --arg ws "$workspace_dir" \
-                --arg ad "$agent_dir" \
-                '. + [{id: $id, name: $id, workspace: $ws, agentDir: $ad}]')
-        done
-
-        # Update agents.list: keep "main" entry, replace agent entries
-        UPDATED_CONFIG=$(cat "$CONFIG_FILE" | jq --argjson list "$agents_list_json" '
-            .agents.list = ([(.agents.list // [])[] | select(.id == "main")] + $list)
-        ')
-        echo "$UPDATED_CONFIG" > "$CONFIG_FILE"
-        log_ok "Provisioned $AGENT_COUNT agent workspace(s)"
-
-        # Generate top-level bindings for multi-agent routing
-        # Without bindings, all agents route to "main"
-        log_info "Generating agent bindings..."
-        local bindings_json
-        bindings_json=$(echo "$AGENTS_JSON" | jq '[.[] | {
-            match: {channel: "ax-platform", accountId: (.handle // "@agent" | ltrimstr("@"))},
-            agentId: (.handle // "@agent" | ltrimstr("@"))
-        }]')
-        UPDATED_CONFIG=$(cat "$CONFIG_FILE" | jq --argjson bindings "$bindings_json" '.bindings = $bindings')
-        echo "$UPDATED_CONFIG" > "$CONFIG_FILE"
-        log_ok "Generated $AGENT_COUNT binding(s) for multi-agent routing"
+            UPDATED_CONFIG=$(jq --arg id "$agent_name" --arg ws "$workspace_dir" --arg ad "$agent_dir" '
+                .agents.list += [{id: $id, name: $id, workspace: $ws, agentDir: $ad}]
+            ' "$CONFIG_FILE")
+            echo "$UPDATED_CONFIG" > "$CONFIG_FILE"
+            agents_added=$((agents_added + 1))
+            log_info "  Added new agent entry: $agent_name"
+        fi
+    done
+    if [[ "$agents_added" -eq 0 ]]; then
+        log_ok "All agent entries already exist (no changes)"
+    else
+        log_ok "Added $agents_added new agent entry/entries"
     fi
 
-    # Clean stale env vars from plist (prevents signature verification failures)
-    # Only applies to macOS (launchctl); Linux uses systemd
+    # Ensure each agent has a binding (merge, don't replace)
+    log_info "Ensuring agent bindings exist..."
+    local bindings_added=0
+    for handle_raw in $(echo "$AGENTS_JSON" | jq -r '.[].handle // "@agent"'); do
+        local agent_name="${handle_raw#@}"
+        local has_binding
+        has_binding=$(jq --arg id "$agent_name" '
+            .bindings // [] | map(select(.match.channel == "ax-platform" and .match.accountId == $id)) | length
+        ' "$CONFIG_FILE")
+
+        if [[ "$has_binding" -eq 0 ]]; then
+            UPDATED_CONFIG=$(jq --arg id "$agent_name" '
+                .bindings += [{match: {channel: "ax-platform", accountId: $id}, agentId: $id}]
+            ' "$CONFIG_FILE")
+            echo "$UPDATED_CONFIG" > "$CONFIG_FILE"
+            bindings_added=$((bindings_added + 1))
+            log_info "  Added binding: $agent_name"
+        fi
+    done
+    if [[ "$bindings_added" -eq 0 ]]; then
+        log_ok "All bindings already exist (no changes)"
+    else
+        log_ok "Added $bindings_added new binding(s)"
+    fi
+
+    # Clean stale env vars from plist (macOS only)
     if [[ "$(uname)" == "Darwin" ]]; then
         if clean_plist_env; then
             cmd_restart_quiet
         else
-            # Plist was modified - need full reload
             cmd_reload
         fi
     else
@@ -262,7 +299,7 @@ cmd_sync() {
     cmd_verify
 }
 
-# Clean install
+# Clean install — only use when the extension is genuinely broken
 cmd_clean() {
     check_deps
     check_env_file
@@ -274,27 +311,45 @@ cmd_clean() {
     echo -e "${CYAN}===========================================${NC}"
     echo ""
 
+    # Back up config before any changes
+    backup_config
+
     if [[ -d "$EXTENSION_DIR" ]]; then
         log_info "Removing old extension at $EXTENSION_DIR"
         rm -rf "$EXTENSION_DIR"
     fi
 
-    log_info "Clearing plugin config from clawdbot.json"
-    CLEARED_CONFIG=$(cat "$CONFIG_FILE" | jq '
-        del(.plugins.entries["ax-platform"]) |
-        del(.plugins.installs["ax-platform"])
-    ')
-    echo "$CLEARED_CONFIG" > "$CONFIG_FILE"
+    # Remove installs entry (but preserve plugin entries config)
+    log_info "Clearing install manifest..."
+    UPDATED_CONFIG=$(jq 'del(.plugins.installs["ax-platform"])' "$CONFIG_FILE")
+    echo "$UPDATED_CONFIG" > "$CONFIG_FILE"
 
     log_info "Reinstalling plugin..."
     cd "$SCRIPT_DIR/extension"
-    $CLI_CMD plugins install . 2>&1 | grep -v "^\[" || true
+    if $CLI_CMD plugins install . 2>&1 | head -5; then
+        log_ok "Plugin installed"
+    else
+        # Fallback: manual copy if CLI install fails
+        log_warn "CLI install failed, copying manually..."
+        mkdir -p "$EXTENSION_DIR"
+        cp -r "$SCRIPT_DIR/extension/"* "$EXTENSION_DIR/"
+        UPDATED_CONFIG=$(jq --arg src "$SCRIPT_DIR/extension" --arg dst "$EXTENSION_DIR" '
+            .plugins.installs["ax-platform"] = {
+                source: "path",
+                sourcePath: $src,
+                installPath: $dst,
+                version: "0.2.0",
+                installedAt: (now | strftime("%Y-%m-%dT%H:%M:%S.000Z"))
+            }
+        ' "$CONFIG_FILE")
+        echo "$UPDATED_CONFIG" > "$CONFIG_FILE"
+        log_ok "Extension installed (manual copy)"
+    fi
     cd "$SCRIPT_DIR"
 
-    log_ok "Clean install complete"
     echo ""
 
-    # Now sync
+    # Now sync credentials (safe — won't overwrite other config)
     cmd_sync
 }
 
@@ -313,7 +368,6 @@ cmd_secret() {
     echo ""
     log_info "Updating secret for agent ${agent_id:0:8}..."
 
-    # Find and update the agent in ax-agents.env
     local found=false
     local temp_file=$(mktemp)
 
@@ -360,7 +414,6 @@ cmd_add() {
         exit 1
     fi
 
-    # Find next agent number
     local max_num=0
     if [[ -f "$ENV_FILE" ]]; then
         while IFS= read -r line; do
@@ -374,7 +427,6 @@ cmd_add() {
     fi
 
     local next_num=$((max_num + 1))
-
     echo "AGENT_${next_num}=${id}|${secret}|${handle:-@agent}|${env:-prod}" >> "$ENV_FILE"
 
     log_ok "Added agent ${handle:-$id} as AGENT_${next_num}"
@@ -439,78 +491,113 @@ cmd_list() {
     done < "$ENV_FILE"
 }
 
-# Clean up stale AX_* env vars from LaunchAgent plist
-# These can override clawdbot.json config and cause signature verification failures
+# Clean up stale AX_* env vars from LaunchAgent plist (macOS only)
 clean_plist_env() {
     local plist_file="$HOME/Library/LaunchAgents/${LAUNCH_AGENT}.plist"
 
     if [[ ! -f "$plist_file" ]]; then
-        return 0  # No plist to clean
+        return 0
     fi
 
-    # Check if plist contains any AX_ env vars
     if grep -q "AX_AGENTS\|AX_AGENT_ID\|AX_WEBHOOK_SECRET" "$plist_file" 2>/dev/null; then
         log_info "Removing stale AX_* env vars from LaunchAgent plist..."
-
-        # Use PlistBuddy to remove the keys (macOS native tool)
         /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:AX_AGENTS" "$plist_file" 2>/dev/null || true
         /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:AX_AGENT_ID" "$plist_file" 2>/dev/null || true
         /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:AX_WEBHOOK_SECRET" "$plist_file" 2>/dev/null || true
-
-        log_ok "Cleaned plist env vars (secrets now come from clawdbot.json only)"
-        return 1  # Signal that plist was modified
+        log_ok "Cleaned plist env vars"
+        return 1  # Signal plist was modified
     fi
 
-    return 0  # No changes needed
+    return 0
 }
 
-# Restart gateway (with full reload if plist changed)
-cmd_restart() {
-    log_info "Restarting gateway..."
+# Find and signal the running gateway process
+# Works on both macOS (launchctl) and Linux (systemd or direct process)
+gateway_restart() {
     if [[ "$(uname)" == "Darwin" ]]; then
         launchctl stop $LAUNCH_AGENT 2>/dev/null || true
         sleep 2
         launchctl start $LAUNCH_AGENT
-    else
-        sudo systemctl restart ${LAUNCH_AGENT}.service 2>/dev/null || \
-        systemctl --user restart ${LAUNCH_AGENT}.service 2>/dev/null || \
-        { log_warn "Could not restart via systemctl. Restart manually."; return; }
+        sleep 3
+        return 0
     fi
-    sleep 3
-    log_ok "Gateway restarted"
+
+    # Linux: try systemctl first, then direct process signal
+    if systemctl --user restart openclaw-gateway.service 2>/dev/null; then
+        sleep 3
+        return 0
+    fi
+
+    if sudo systemctl restart openclaw-gateway.service 2>/dev/null; then
+        sleep 3
+        return 0
+    fi
+
+    # Fallback: signal the running process directly
+    local gw_pid
+    gw_pid=$(pgrep -x openclaw-gateway 2>/dev/null | head -1)
+    if [[ -n "$gw_pid" ]]; then
+        log_info "Sending SIGHUP to gateway (PID $gw_pid)..."
+        kill -HUP "$gw_pid" 2>/dev/null || true
+        sleep 3
+        # Check if it's still running (SIGHUP may trigger config reload)
+        if kill -0 "$gw_pid" 2>/dev/null; then
+            log_ok "Gateway signaled (PID $gw_pid)"
+            return 0
+        fi
+    fi
+
+    # Last resort: kill and restart
+    if [[ -n "$gw_pid" ]]; then
+        log_info "Stopping gateway (PID $gw_pid)..."
+        kill "$gw_pid" 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Try to start via CLI (openclaw gateway --port ...)
+    log_info "Starting gateway..."
+    local cli_path
+    cli_path=$(command -v "$CLI_CMD" 2>/dev/null || echo "")
+    if [[ -n "$cli_path" ]]; then
+        local port="${OPENCLAW_GATEWAY_PORT:-18789}"
+        nohup "$cli_path" gateway --port "$port" > "$CONFIG_DIR/gateway-restart.log" 2>&1 &
+        sleep 4
+        if pgrep -f "$CLI_CMD.*gateway" > /dev/null 2>&1; then
+            local new_pid
+            new_pid=$(pgrep -f "$CLI_CMD.*gateway" | head -1)
+            log_ok "Gateway started (PID $new_pid)"
+            return 0
+        fi
+    fi
+
+    log_warn "Could not restart gateway automatically."
+    log_warn "Please restart manually: $CLI_CMD gateway --port 18789 &"
+    return 1
+}
+
+cmd_restart() {
+    log_info "Restarting gateway..."
+    gateway_restart
     cmd_verify
 }
 
-# Full reload (unload/load) - needed when plist changes (macOS only)
+# Full reload (macOS only — unload/load plist)
 cmd_reload() {
     log_info "Reloading gateway..."
     if [[ "$(uname)" == "Darwin" ]]; then
         launchctl unload ~/Library/LaunchAgents/${LAUNCH_AGENT}.plist 2>/dev/null || true
         sleep 2
         launchctl load ~/Library/LaunchAgents/${LAUNCH_AGENT}.plist 2>/dev/null || true
+        sleep 3
+        log_ok "Gateway reloaded"
     else
-        sudo systemctl daemon-reload 2>/dev/null || true
-        sudo systemctl restart ${LAUNCH_AGENT}.service 2>/dev/null || \
-        systemctl --user restart ${LAUNCH_AGENT}.service 2>/dev/null || \
-        { log_warn "Could not reload via systemctl. Restart manually."; return; }
+        gateway_restart
     fi
-    sleep 3
-    log_ok "Gateway reloaded"
 }
 
 cmd_restart_quiet() {
     log_info "Restarting gateway..."
-    if [[ "$(uname)" == "Darwin" ]]; then
-        launchctl stop $LAUNCH_AGENT 2>/dev/null || true
-        sleep 2
-        launchctl start $LAUNCH_AGENT
-    else
-        sudo systemctl restart ${LAUNCH_AGENT}.service 2>/dev/null || \
-        systemctl --user restart ${LAUNCH_AGENT}.service 2>/dev/null || \
-        { log_warn "Could not restart via systemctl. Restart manually."; return; }
-    fi
-    sleep 3
-    log_ok "Gateway restarted"
+    gateway_restart
 }
 
 # Verify registration
@@ -521,13 +608,26 @@ cmd_verify() {
     echo -e "${CYAN}===========================================${NC}"
     echo ""
 
-    if tail -30 "$CONFIG_DIR/logs/gateway.log" 2>/dev/null | grep -q "ax-platform.*Registered agents"; then
-        tail -30 "$CONFIG_DIR/logs/gateway.log" | grep "ax-platform" | grep -E "Registered|@" | tail -5
+    # Check multiple log locations
+    local log_file=""
+    for candidate in "$CONFIG_DIR/logs/gateway.log" "$CONFIG_DIR/gateway-restart.log"; do
+        if [[ -f "$candidate" ]]; then
+            log_file="$candidate"
+            break
+        fi
+    done
+
+    if [[ -n "$log_file" ]] && tail -30 "$log_file" 2>/dev/null | grep -q "ax-platform.*Registered agents\|ax-platform.*Plugin loaded"; then
+        tail -30 "$log_file" | grep "ax-platform" | grep -E "Registered|@|Plugin loaded" | tail -5
         echo ""
         log_ok "Setup complete!"
+    elif pgrep -x openclaw-gateway > /dev/null 2>&1; then
+        local gw_pid=$(pgrep -x openclaw-gateway | head -1)
+        log_ok "Gateway running (PID $gw_pid)"
+        log_info "Check logs: tail -f $CONFIG_DIR/gateway-restart.log | grep ax-platform"
     else
         log_warn "Could not verify registration. Check logs:"
-        echo "  tail -f $CONFIG_DIR/logs/gateway.log | grep ax-platform"
+        echo "  tail -f $CONFIG_DIR/gateway-restart.log | grep ax-platform"
     fi
     echo ""
 }
@@ -536,7 +636,14 @@ cmd_verify() {
 cmd_logs() {
     log_info "Tailing gateway logs (Ctrl+C to exit)..."
     echo ""
-    tail -f "$CONFIG_DIR/logs/gateway.log" | grep --line-buffered "ax-platform"
+    # Try multiple log locations
+    for candidate in "$CONFIG_DIR/logs/gateway.log" "$CONFIG_DIR/gateway-restart.log"; do
+        if [[ -f "$candidate" ]]; then
+            tail -f "$candidate" | grep --line-buffered "ax-platform"
+            return
+        fi
+    done
+    log_error "No log file found"
 }
 
 # Check status
@@ -548,8 +655,12 @@ cmd_status() {
     echo ""
 
     # Gateway
-    if pgrep -f "(clawdbot|openclaw).*gateway" > /dev/null; then
-        log_ok "Gateway: Running"
+    local gw_pid
+    gw_pid=$(pgrep -x openclaw-gateway 2>/dev/null | head -1)
+    if [[ -n "$gw_pid" ]]; then
+        local uptime
+        uptime=$(ps -o etime= -p "$gw_pid" 2>/dev/null | tr -d ' ')
+        log_ok "Gateway: Running (PID $gw_pid, uptime $uptime)"
     else
         log_error "Gateway: Not running"
     fi
@@ -569,7 +680,13 @@ cmd_status() {
     # Agents in config
     if [[ -f "$ENV_FILE" ]]; then
         local count=$(grep -c "^AGENT_" "$ENV_FILE" 2>/dev/null || echo 0)
-        log_info "Agents configured: $count"
+        log_info "Agents in env file: $count"
+    fi
+
+    # Agents in config file
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local config_count=$(jq '.plugins.entries["ax-platform"].config.agents | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+        log_info "Agents in config: $config_count"
     fi
 
     echo ""
