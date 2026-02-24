@@ -171,6 +171,13 @@ cmd_sync() {
     else
         log_warn "Extension install had warnings (check logs)"
     fi
+    # Install extension dependencies (plugins install copies files but may not run npm install)
+    if [[ -f "$EXTENSION_DIR/package.json" ]]; then
+        log_info "Installing extension dependencies..."
+        cd "$EXTENSION_DIR"
+        npm install --production 2>&1 | tail -3
+        log_ok "Extension dependencies installed"
+    fi
     cd "$SCRIPT_DIR"
 
     log_info "Updating clawdbot.json..."
