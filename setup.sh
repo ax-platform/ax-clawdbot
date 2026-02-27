@@ -269,6 +269,15 @@ cmd_sync() {
         log_ok "Added $agents_added new agent entry/entries"
     fi
 
+    # Install extension dependencies (plugins install copies files but may not run npm install)
+    if [[ -f "$EXTENSION_DIR/package.json" ]]; then
+        log_info "Installing extension dependencies..."
+        cd "$EXTENSION_DIR"
+        npm install --production 2>&1 | tail -3
+        log_ok "Extension dependencies installed"
+    fi
+    cd "$SCRIPT_DIR"
+
     # Ensure each agent has a binding (merge, don't replace)
     log_info "Ensuring agent bindings exist..."
     local bindings_added=0
